@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/anthid-labs/treesync"
@@ -47,7 +47,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # as `^0.1.0`, so a published `treesync-cli 0.1.1` would happily resolve against
 # the older `treesync 0.1.0` on crates.io rather than the library it shipped
 # with.
-treesync = { path = "crates/treesync", version = "0.1.17" }
+treesync = { path = "crates/treesync", version = "0.1.18" }
 
 # Async runtime
 tokio = { version = "1.53", features = ["full"] }
