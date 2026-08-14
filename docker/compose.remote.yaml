@@ -1,0 +1,95 @@
+# Two "servers" on one host: a treesync client and a real sshd it syncs into
+# over a real SSH connection. The target has its own filesystem, its own user
+# and its own network identity, which is as far as treesync can tell the same
+# thing as a second machine.
+#
+#   docker compose -f docker/compose.remote.yaml up --build
+#
+# Then edit anything under docker/example/remote/src and watch it land on the
+# target. To look at what arrived:
+#
+#   docker compose -f docker/compose.remote.yaml exec target find /home/deploy/target
+#
+# One-shot instead of a daemon:
+#
+#   docker compose -f docker/compose.remote.yaml run --rm treesync sync --dry-run
+#   docker compose -f docker/compose.remote.yaml run --rm treesync sync
+#
+# Tear down, keys and all:
+#
+#   docker compose -f docker/compose.remote.yaml down -v
+
+services:
+  # Generates the keypair the other two share. A named volume rather than
+  # host-side ssh-keygen: the key then has an ownership and mode that mean the
+  # same thing in both containers, which a bind-mounted key from the host does
+  # not.
+  #
+  # Idempotent, so `up` a second time keeps the key the target already trusts.
+  keygen:
+    build:
+      context: ..
+      dockerfile: docker/test-sshd.Dockerfile
+    image: treesync-sshd:dev
+    volumes:
+      - keys:/keys
+    # Exec form, not a folded scalar: compose shlex-splits a string command,
+    # which mangles the embedded quoting.
+    command:
+      - sh
+      - -c
+      - >-
+        test -f /keys/id_ed25519 ||
+        ssh-keygen -q -t ed25519 -N '' -C treesync-compose -f /keys/id_ed25519;
+        chmod 600 /keys/id_ed25519; chmod 644 /keys/id_ed25519.pub
+
+  # The far end. Key auth only, no password on the account, and the agent is
+  # deliberately NOT preinstalled: treesync uploads it on first connection, so
+  # a fresh `up` exercises that path every time.
+  target:
+    build:
+      context: ..
+      dockerfile: docker/test-sshd.Dockerfile
+    image: treesync-sshd:dev
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+    volumes:
+      - keys:/keys:ro
+    # authorized_keys is installed at start rather than baked in, because the
+    # key does not exist at build time. `install` sets owner and mode in one
+    # step: sshd refuses a key file it considers group-writable or foreign.
+    command:
+      - sh
+      - -c
+      - >-
+        install -m 600 -o deploy -g deploy
+        /keys/id_ed25519.pub /home/deploy/.ssh/authorized_keys
+        && exec /usr/sbin/sshd -D -e
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  treesync:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: treesync:dev
+    depends_on:
+      target:
+        condition: service_healthy
+    init: true
+    stop_grace_period: 15s
+    volumes:
+      - ./example/remote/config:/etc/treesync:ro
+      - ./example/remote/src:/data/src
+      - keys:/keys:ro
+    environment:
+      RUST_LOG: treesync=debug
+    # No CMD in the image on purpose, so the subcommand is stated here.
+    command: watch
+
+volumes:
+  keys:

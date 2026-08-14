@@ -1,0 +1,27 @@
+# Local run. `docker compose run --rm treesync check` to validate a config,
+# `... sync` for one pass, `docker compose up` with `command: watch` to leave it
+# mirroring.
+services:
+  treesync:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: treesync:dev
+
+    # A second line of defence for the commands that do not handle signals
+    # themselves. `watch` installs its own. See the note in the Dockerfile.
+    init: true
+
+    # Bounds how long the shutdown flush gets. treesync's own grace is 5s, so
+    # this leaves headroom for the final reconcile to finish rather than being
+    # killed midway through writing a file.
+    stop_grace_period: 15s
+
+    volumes:
+      - ./example/config:/etc/treesync:ro
+      - ./example/src:/data/src
+      - ./example/dst:/data/dst
+
+    environment:
+      # treesync reads RUST_LOG in preference to this.
+      LOG_LEVEL: info

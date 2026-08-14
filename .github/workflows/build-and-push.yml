@@ -1,0 +1,426 @@
+name: "🏗️ Build and Push Docker Image"
+
+on:
+  push:
+    branches: [main]
+    # `**` and not `*`. A single star does not match `/`, so `apps/*` matches
+    # `apps/treesync-cli` and nothing under it. Every source file is at least
+    # two levels deep, so the single-star form skipped this workflow for pure
+    # Rust changes, taking the tests and the crates.io publish with it.
+    paths:
+      - apps/**
+      - crates/**
+      - docker/**
+      - Cargo.*
+      # A change to the workflow itself, or to the scan it calls, should be
+      # exercised by running it.
+      - .github/workflows/**
+      # Last, so it subtracts from every pattern above: the crate READMEs live
+      # under apps/ and crates/, and prose changes nothing an image or a test
+      # can observe. Order is what makes this work, as the later pattern wins.
+      - '!**.md'
+  # Deliberately unfiltered, and it has to stay that way. "Lint and test" is a
+  # required check, and a workflow skipped by a path filter never reports one,
+  # so a documentation pull request would wait forever for a status that is
+  # never coming. The `changes` job decides what actually runs instead.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Named from the owner rather than the repository, so the image keeps its name
+  # if the repository is renamed.
+  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/treesync
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Decide what needs running
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+    steps:
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Anything that is not a pull request arrived through the path filter
+          # above, which already subtracts documentation, so by definition
+          # there is something to act on.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Asked of the API rather than worked out from a checkout: it needs
+          # no clone, and it cannot disagree with GitHub about the merge base.
+          changed="$(gh api --paginate --jq '.[].filename' \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files")"
+
+          echo "Changed files:"
+          printf '%s\n' "$changed"
+
+          # Prose and deployment examples carry nothing the compiler, the
+          # tests, the scanners or the image build can act on. No crate pulls a
+          # README into its rustdoc, so no doctest depends on one either.
+          code="$(printf '%s\n' "$changed" | grep -vE '\.md$|^examples/|^LICENSE$' || true)"
+
+          if [ -n "$code" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Documentation and examples only; nothing to build or scan." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint-and-test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    needs: changes
+    # Without this a hung test holds the runner until GitHub's six-hour
+    # default, which is how one livelocked test costs a whole job rather than
+    # failing. The suite runs in minutes, so this is a ceiling, not a target.
+    timeout-minutes: 30
+
+    # The job always runs, so the required check always reports. Its steps are
+    # what a documentation change skips, which costs a runner start instead of
+    # a toolchain install, a cache restore and a full workspace test run.
+    steps:
+      - name: Checkout
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        if: needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        if: needs.changes.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: needs.changes.outputs.code == 'true'
+        run: cargo fmt --check
+
+      - name: Run Clippy (all targets, all features)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # First time the filesystem suites run against inotify. Everything so far
+      # has only been exercised on macOS/FSEvents, and the two backends differ
+      # in ways the code documents but nothing has verified.
+      - name: Run tests
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test --workspace
+
+  prepare:
+    name: Prepare Docker build context
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    # Nothing downstream of here runs for a pull request, so the tag derivation
+    # is skipped too rather than computing tags no job will use.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read the workspace version
+        id: version
+        run: |
+          set -euo pipefail
+
+          # Parsed as TOML rather than grepped, so a second `version =` key
+          # appearing anywhere in the file cannot be picked up by accident.
+          # `tomllib` is in the standard library from Python 3.11, and needs no
+          # toolchain or network, unlike `cargo metadata`.
+          version="$(python3 -c '
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print(tomllib.load(f)["workspace"]["package"]["version"])
+          ')"
+
+          echo "Workspace version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Three tags per build, all from the default branch only:
+      #
+      #   sha-<commit>  every build, so any image can be traced to its source
+      #   <version>     the version from Cargo.toml, so an image can be pinned
+      #                 to the same number as the published crates
+      #   latest        the newest build on main
+      #
+      # The version tag is not immutable. Pushing to main twice without bumping
+      # the version moves it to the newer build, because a registry overwrites a
+      # tag where crates.io refuses a duplicate version. The sha tag is the one
+      # that always identifies exactly one image.
+      #
+      # These are YAML comments and not lines inside `tags:` below. That block is
+      # a literal scalar, so a `#` there is passed to the action as text.
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE_REPO }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=${{ steps.version.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - id: tag
+        run: |
+          sha_tag="$(echo "${{ steps.meta.outputs.tags }}" | grep -E ':(sha-[0-9a-f]+)$' | head -n1 | sed 's/.*://')"
+          echo "image_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
+
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+
+  build-and-push-arm:
+    name: Build and push Docker image (Arm64)
+    # GitHub's hosted ARM runner. Native, so no emulation: a cross-build under
+    # QEMU measured ~30x slower than native for this project.
+    runs-on: ubuntu-24.04-arm
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Derive Arm64 tags
+        id: arch-tags
+        run: |
+          {
+            echo "tags<<EOF"
+            while IFS= read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "${tag}-arm64"
+            done <<< "${{ needs.prepare.outputs.tags }}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.arch-tags.outputs.tags }}
+          labels: ${{ needs.prepare.outputs.labels }}
+
+  build-and-push-amd64:
+    name: Build and push Docker image (Amd64)
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Derive Amd64 tags
+        id: arch-tags
+        run: |
+          {
+            echo "tags<<EOF"
+            while IFS= read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "${tag}-amd64"
+            done <<< "${{ needs.prepare.outputs.tags }}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.arch-tags.outputs.tags }}
+          labels: ${{ needs.prepare.outputs.labels }}
+
+  container-scan:
+    name: Scan image
+    # Runs against the amd64 arch tag rather than the merged manifest, because
+    # that tag exists before the manifest does. Scanning here is what lets a
+    # vulnerable build stop short of `latest`: the arch tags are intermediate,
+    # but the manifest below is what anyone actually pulls.
+    #
+    # Only amd64 is scanned. Both arches install the same apk set on the same
+    # base, so the package surface Trivy reports is the same one; a per-arch
+    # difference would have to come from the base image itself.
+    needs:
+      - prepare
+      - build-and-push-amd64
+    uses: ./.github/workflows/container-scan.yml
+    with:
+      image_repository: ghcr.io/${{ github.repository_owner }}/treesync
+      image_tag: ${{ needs.prepare.outputs.image_tag }}-amd64
+
+  merge-manifests:
+    name: Publish multi-arch manifest
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build-and-push-arm
+      - build-and-push-amd64
+      - container-scan
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker buildx imagetools create \
+              --tag "$tag" \
+              "${tag}-arm64" \
+              "${tag}-amd64"
+          done <<< "${{ needs.prepare.outputs.tags }}"
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # Last, and only after the image is out. A failed build, a failed test or a
+    # vulnerable image should not produce a release on crates.io, and a publish
+    # cannot be taken back: a version number is burned even if the crate is
+    # yanked a minute later.
+    needs:
+      - lint-and-test
+      - merge-manifests
+    # Never from a pull request, and never from a branch. A fork opening a PR
+    # would otherwise reach a job holding the publish token.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish any version that is not on crates.io yet
+        env:
+          # Read by cargo directly, so the token never appears in a command
+          # line where `ps` would show it.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set; nothing to publish with." >&2
+            exit 1
+          fi
+
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "treesync") | .version')"
+          echo "Workspace version: $version"
+
+          # 200 when this exact version exists on crates.io, 404 when it does
+          # not. Anything else is the registry being unavailable, which must not
+          # read as "not published" and cause a duplicate publish attempt.
+          crate_status() {
+            curl -sS -o /dev/null -w '%{http_code}' \
+              -H 'User-Agent: treesync-ci (github actions)' \
+              "https://crates.io/api/v1/crates/$1/$2"
+          }
+
+          already_published() {
+            local status
+            status="$(crate_status "$1" "$2")"
+
+            case "$status" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *)
+                echo "crates.io returned $status for $1 $2; refusing to guess." >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          # `cargo publish` waits for its own crate to land in the index, but
+          # the dependent crate's verification build resolves `treesync` from
+          # the registry, so confirm it is really there before moving on.
+          wait_until_available() {
+            for _ in $(seq 1 60); do
+              if already_published "$1" "$2"; then
+                return 0
+              fi
+              sleep 5
+            done
+
+            echo "timed out waiting for $1 $2 to appear on crates.io" >&2
+            exit 1
+          }
+
+          published_any=false
+
+          # In dependency order. `treesync-cli` depends on `treesync` at this
+          # exact version, so the library has to exist first.
+          for crate in treesync treesync-cli; do
+            if already_published "$crate" "$version"; then
+              echo "$crate $version is already published; skipping."
+              continue
+            fi
+
+            echo "Publishing $crate $version"
+            cargo publish --locked --package "$crate"
+            wait_until_available "$crate" "$version"
+
+            published_any=true
+            echo "Published $crate $version"
+          done
+
+          if [ "$published_any" = true ]; then
+            echo "### Published \`$version\` to crates.io" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Nothing to publish: $version is already on crates.io." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  report:
+    name: Report
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - merge-manifests
+      - publish-crates
+    # The publish job is skipped on a pull request, and a skipped dependency
+    # would otherwise skip this too.
+    if: always() && needs.merge-manifests.result == 'success'
+    steps:
+      - name: Report
+        run: |
+          echo "Built image tag: ${{ needs.prepare.outputs.image_tag }}"

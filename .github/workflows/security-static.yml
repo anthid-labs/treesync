@@ -1,0 +1,211 @@
+name: 🔐 static security analysis
+
+# Runs on every pull request and again on main after the merge. The two runs
+# are not redundant: the PR run scans the merge preview, and the main run is
+# the one that scans what actually shipped, including anything that landed
+# through a bypass or a stale-base merge.
+on:
+  # Unfiltered on purpose: both jobs below are required checks, and a workflow
+  # skipped by a path filter never reports one, which would leave a
+  # documentation pull request unmergeable. The `changes` job gates the work.
+  pull_request:
+  push:
+    branches: [main]
+    # Nothing here is a required check, so a push can be filtered outright.
+    paths-ignore:
+      - '**.md'
+      - examples/**
+      - LICENSE
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-static-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Decide what needs running
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+    steps:
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Anything that is not a pull request arrived through the path filter
+          # above, which already subtracts documentation, so by definition
+          # there is something to act on.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Asked of the API rather than worked out from a checkout: it needs
+          # no clone, and it cannot disagree with GitHub about the merge base.
+          changed="$(gh api --paginate --jq '.[].filename' \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files")"
+
+          echo "Changed files:"
+          printf '%s\n' "$changed"
+
+          # Prose and deployment examples carry nothing the compiler, the
+          # tests, the scanners or the image build can act on. No crate pulls a
+          # README into its rustdoc, so no doctest depends on one either.
+          code="$(printf '%s\n' "$changed" | grep -vE '\.md$|^examples/|^LICENSE$' || true)"
+
+          if [ -n "$code" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Documentation and examples only; nothing to build or scan." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  sast:
+    name: SAST (Semgrep)
+
+    runs-on: ubuntu-latest
+
+    needs: changes
+
+    # A scanner that wedges should fail the job, not hold the runner for six
+    # hours.
+    timeout-minutes: 20
+
+    # The engine is pinned so a rule-engine release cannot turn a green branch
+    # red on its own. The rule packs are still fetched from the registry on
+    # every run, so pinning the image does not freeze coverage.
+    container:
+      image: semgrep/semgrep:1.172.0
+
+    steps:
+      - name: Checkout
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v6
+
+      - name: Run Semgrep
+        if: needs.changes.outputs.code == 'true'
+        # `--error` is deliberately not passed: it exits non-zero on *any*
+        # finding, INFO included. Gating happens in the next step instead, so
+        # a low-severity note lands in the summary without blocking a branch.
+        run: |
+          semgrep scan \
+            --config p/rust \
+            --config p/security-audit \
+            --config p/secrets \
+            --metrics=off \
+            --quiet \
+            --json --output semgrep.json \
+            .
+
+      - name: Report findings and gate on ERROR
+        if: always() && needs.changes.outputs.code == 'true'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, sys
+
+          try:
+              with open("semgrep.json") as fh:
+                  results = json.load(fh).get("results", [])
+          except (OSError, ValueError) as exc:
+              print("### SAST (Semgrep)\n")
+              print(f"Scan produced no readable report: `{exc}`")
+              sys.exit(1)
+
+          order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
+          results.sort(key=lambda r: order.get(r["extra"].get("severity"), 3))
+          blocking = [r for r in results if r["extra"].get("severity") == "ERROR"]
+
+          print("### SAST (Semgrep)\n")
+          if not results:
+              print("No findings.")
+              sys.exit(0)
+
+          print(f"{len(results)} finding(s), {len(blocking)} blocking.\n")
+          print("| Severity | Rule | Location |")
+          print("| --- | --- | --- |")
+          for r in results:
+              rule = r["check_id"].rsplit(".", 1)[-1]
+              loc = f'{r["path"]}:{r["start"]["line"]}'
+              print(f'| {r["extra"].get("severity")} | `{rule}` | `{loc}` |')
+
+          if blocking:
+              print("\nFailing: ERROR-severity findings must be fixed or "
+                    "explicitly ignored with a `nosemgrep` comment.")
+          sys.exit(1 if blocking else 0)
+          PY
+
+      - name: Upload Semgrep report
+        if: always() && needs.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: semgrep-report
+          path: semgrep.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  dependencies:
+    name: Dependency advisories (cargo audit)
+
+    runs-on: ubuntu-latest
+
+    needs: changes
+
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        if: needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        if: needs.changes.outputs.code == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        if: needs.changes.outputs.code == 'true'
+        # Audits the workspace `Cargo.lock`, so this covers every service, not
+        # just the one that triggered the run. Unmaintained/unsound advisories
+        # are reported but do not fail the job; add `--deny warnings` to gate
+        # on those too.
+        run: |
+          set +e
+          cargo audit --color never > audit.txt 2>&1
+          status=$?
+          set -e
+
+          {
+            echo '### Dependency advisories (cargo audit)'
+            echo
+            echo '```'
+            cat audit.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $status
+
+      - name: Upload audit report
+        if: always() && needs.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-audit-report
+          path: audit.txt
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,42 @@
+# Shared by the Compose and Swarm examples, and the same shape the Kubernetes
+# ConfigMap inlines.
+#
+# Mounted at /etc/treesync/config.toml, which is where the CLI looks by default,
+# so no --config flag is needed. Unknown keys are a startup error and not a
+# setting that silently never applied, so a typo here fails loudly.
+
+[[sync]]
+name = "app"
+source = "/data/src"
+
+# How long events are batched before treesync acts on them. Longer batches more
+# work into one pass; shorter reduces lag. A delay shorter than a transfer takes
+# is fine: the queue collapses a burst into the distinct paths that changed, so
+# work per pass tracks the tree and not how often each file was touched.
+delay = "1s"
+
+# Off by default, and left off here. The target is usually the copy without a
+# backup, and a source that is briefly unreadable is hard to tell apart from one
+# whose files were really deleted. Turn it on deliberately, once the exclude
+# list is right.
+delete = false
+
+# Applied to BOTH trees. Filtering only the source would make every excluded
+# file on the target look like a deletion, and `delete = true` would then remove
+# exactly the files this was meant to protect.
+exclude = ["*.tmp", ".git/"]
+
+  [sync.target]
+  type = "local"
+  path = "/data/dst"
+
+  # To mirror to another host instead, replace the two lines above with:
+  #
+  #   type = "ssh"
+  #   host = "deploy@example.com"
+  #   path = "/srv/app"
+  #   identity_file = "/etc/treesync/ssh/id_ed25519"
+  #
+  # Nothing has to be installed there first. treesync connects, and if no usable
+  # agent answers it uploads one and connects again. A changed file is then sent
+  # as a rolling-checksum delta against the copy the target already holds.

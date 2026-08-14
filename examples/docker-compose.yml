@@ -1,0 +1,96 @@
+# treesync under Docker Compose.
+#
+#   docker compose run --rm treesync check     validate the config, touch nothing
+#   docker compose run --rm treesync sync      one pass, then exit
+#   docker compose up -d                       stay up, mirroring changes
+#
+# The config lives at ./config/config.toml relative to this file. Reproduced
+# here so the example reads on its own, and kept identical to that file: a
+# sample that drifts from the thing it claims to copy is worse than no sample,
+# because the copied version is the one that runs.
+#
+#   [[sync]]
+#   name = "app"
+#   source = "/data/src"
+#   delay = "1s"
+#   delete = false
+#   exclude = ["*.tmp", ".git/"]
+#
+#     [sync.target]
+#     type = "local"
+#     path = "/data/dst"
+#
+# `delete` is off, which is the default and the right starting point. Turning it
+# on propagates removals, so anything on the target that the source does not
+# have goes, including files put there by something else and anything the
+# exclude list does not cover. Check what that would do before enabling it:
+#
+#   docker compose run --rm treesync sync --dry-run
+#
+# which prints the plan and changes nothing.
+
+services:
+  treesync:
+    image: ghcr.io/anthid-labs/treesync:latest
+
+    # No default CMD in the image, deliberately: `sync` would mutate the target
+    # the moment the container started. `watch` mirrors changes as they happen
+    # and stops cleanly on SIGTERM.
+    command: watch
+
+    restart: unless-stopped
+
+    # `watch` installs its own SIGTERM handler, which at PID 1 it has to: the
+    # kernel gives PID 1 no default handlers, so a process that ignores SIGTERM
+    # is SIGKILLed at the timeout and loses its shutdown flush. This is a second
+    # line of defence for `check` and `sync`, which do not handle signals.
+    init: true
+
+    # Long enough for the final reconcile to finish. treesync's own shutdown
+    # grace is 5s, so this leaves headroom rather than killing it midway through
+    # writing a file.
+    stop_grace_period: 15s
+
+    volumes:
+      # Mounted read-only at the CLI's default config location, so no --config
+      # flag is needed.
+      - ./config:/etc/treesync:ro
+
+      # The watched tree. Read-only is safe and worth doing: treesync never
+      # writes to its source, and the flag makes that guarantee the kernel's.
+      - ./src:/data/src:ro
+
+      # The mirror. This one has to be writable.
+      - ./dst:/data/dst
+
+    environment:
+      # `RUST_LOG` takes precedence over this when set. A malformed filter is a
+      # startup failure and not silently dropped logs.
+      LOG_LEVEL: info
+
+    # Reading a large tree is IO-bound rather than memory-hungry: transfers
+    # stream, so memory does not scale with the size of the largest file.
+    # Raise this only if a very large tree makes the index itself big.
+    mem_limit: 256m
+
+    healthcheck:
+      # `check` re-reads and validates the config without touching either tree,
+      # so it is safe to run against a live daemon. It catches a config that was
+      # edited into an invalid state under a running container.
+      test: ["CMD", "treesync", "check"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# To mirror to another host instead of a second volume, drop the ./dst mount,
+# point the target at ssh in config.toml, and mount a key:
+#
+#     volumes:
+#       - ./config:/etc/treesync:ro
+#       - ./src:/data/src:ro
+#       - ./ssh:/etc/treesync/ssh:ro
+#
+# The key must be mode 0600 and owned by the container user, or OpenSSH refuses
+# it. Nothing needs installing on the far host: treesync uploads its own binary
+# as the agent the first time it connects.

@@ -1,0 +1,76 @@
+# treesync on server A, mirroring a local tree onto server B over SSH.
+#
+# Runs on A only. B needs nothing installed: it needs sshd, an account with a
+# writable home, and this host's public key in that account's authorized_keys.
+# treesync uploads its own agent on the first connection and reuses it after.
+#
+# ---------------------------------------------------------------------------
+# One-time setup, on server A, from this directory:
+#
+#   mkdir -p example/two-server/ssh && chmod 700 example/two-server/ssh
+#   ssh-keygen -t ed25519 -N '' -C treesync@$(hostname) \
+#       -f example/two-server/ssh/id_ed25519
+#   chmod 600 example/two-server/ssh/id_ed25519
+#
+#   # install the public key on B (asks for B's password once)
+#   ssh-copy-id -i example/two-server/ssh/id_ed25519.pub deploy@SERVER-B
+#
+#   # pin B's host key. StrictHostKeyChecking=yes below refuses an unknown
+#   # host, and BatchMode (which treesync forces) cannot answer a prompt, so
+#   # this file is what makes the connection possible at all.
+#   ssh-keyscan -H SERVER-B > example/two-server/ssh/known_hosts
+#
+# Then edit example/two-server/config/config.toml (host and path) and the
+# source bind mount below, and:
+#
+#   docker compose -f docker/compose.two-server.yaml up -d
+#   docker compose -f docker/compose.two-server.yaml logs -f
+#
+# Validate before letting it write anything:
+#
+#   docker compose -f docker/compose.two-server.yaml run --rm treesync check
+#   docker compose -f docker/compose.two-server.yaml run --rm treesync sync --dry-run
+# ---------------------------------------------------------------------------
+
+services:
+  treesync:
+    image: ghcr.io/anthid-labs/treesync:latest
+    # Or build from this checkout instead of pulling:
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+
+    # `watch` exits if any sync fails, deliberately: a tree that has quietly
+    # stopped being mirrored looks exactly like one that is up to date. The
+    # restart policy is the other half of that decision, so a transient
+    # failure recovers instead of needing a human.
+    restart: unless-stopped
+
+    # A second line of defence only. `watch` installs its own SIGTERM handler
+    # because it runs as PID 1; the other subcommands do not.
+    init: true
+
+    # treesync's own shutdown grace is 5s. This leaves headroom for the final
+    # reconcile rather than being killed midway through writing a file.
+    stop_grace_period: 15s
+
+    volumes:
+      - ./example/two-server/config:/etc/treesync:ro
+
+      # THE SOURCE TREE ON SERVER A. Change the left side to the real path.
+      # Read-only on purpose: mirroring only ever reads the source, so there is
+      # no reason to hand the container write access to it.
+      - /srv/app:/data/src:ro
+
+      # The private key and the pinned host key. Read-only: with
+      # StrictHostKeyChecking=yes, ssh has no reason to write known_hosts.
+      - ./example/two-server/ssh:/ssh:ro
+
+    environment:
+      # treesync=debug adds the per-batch and per-transfer lines, including the
+      # `sent=` figure that shows what a delta actually cost.
+      RUST_LOG: treesync=info
+
+    # No CMD in the image on purpose: `sync` and `watch` both mutate the target
+    # the moment the container starts, so the subcommand is stated here.
+    command: watch

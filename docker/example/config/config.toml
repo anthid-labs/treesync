@@ -1,0 +1,14 @@
+# Matches the volume layout in compose.yaml.
+[[sync]]
+name = "example"
+source = "/data/src"
+delete = true
+
+# `.gitkeep` keeps the empty target directory in git. Without excluding it,
+# `delete = true` correctly removes it on the first pass, because the source
+# has no such file. That is right behaviour and a confusing first impression.
+exclude = ["*.tmp", ".gitkeep"]
+
+  [sync.target]
+  type = "local"
+  path = "/data/dst"

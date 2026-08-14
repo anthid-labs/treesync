@@ -1,0 +1,16 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Cargo / build noise
+**/*.rs.bk
+
+# Git
+.git
+.gitignore
+
+# OS junk
+.DS_Store
+
+# Logs
+*.log

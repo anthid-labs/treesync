@@ -1,0 +1,34 @@
+# Matches the layout in compose.remote.yaml. Paths are container paths.
+[[sync]]
+name = "remote"
+source = "/data/src"
+delay = "500ms"
+delete = true
+verify = "checksum"
+exclude = ["*.tmp", ".git/", ".DS_Store"]
+
+  [sync.target]
+  type = "ssh"
+  # The compose service name. Docker's embedded DNS resolves it, and `deploy`
+  # is the account test-sshd.Dockerfile creates.
+  host = "deploy@target"
+  path = "/home/deploy/target"
+  identity_file = "/keys/id_ed25519"
+
+  # agent_binary is deliberately absent. It defaults to whichever treesync is
+  # running, and the client image's own binary is a static musl build on the
+  # same architecture as the target, so the default is already right. Set it
+  # only when the two ends differ, which for two containers on one host they
+  # do not.
+
+  # BatchMode=yes is forced by treesync and refuses an unknown host, so the
+  # key has to be dealt with rather than prompted for. accept-new learns it on
+  # the first connection and pins it after that, which is the right trade for
+  # a throwaway target whose host key is regenerated whenever the image is.
+  #
+  # /tmp because it has to be writable, and the keys volume is mounted ro.
+  ssh_options = [
+    "UserKnownHostsFile=/tmp/known_hosts",
+    "StrictHostKeyChecking=accept-new",
+    "GlobalKnownHostsFile=/dev/null",
+  ]

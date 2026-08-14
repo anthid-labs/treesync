@@ -1,0 +1,122 @@
+# treesync as a Docker Swarm stack.
+#
+#   docker stack deploy -c docker-swarm-stack.yml treesync
+#   docker service logs -f treesync_treesync
+#   docker stack rm treesync
+#
+# Swarm differs from Compose in two ways that matter here. Configs and secrets
+# are first-class objects rather than bind mounts, which is what makes this
+# deployable to a node you are not sitting on. And a service is scheduled
+# somewhere in the cluster, so a bind mount only works if the data is on the
+# node that wins the placement. The constraint below pins that down.
+
+version: "3.8"
+
+services:
+  treesync:
+    image: ghcr.io/anthid-labs/treesync:latest
+
+    # The image ships no default command on purpose: `sync` would mutate the
+    # target the moment a task started.
+    command: watch
+
+    configs:
+      - source: treesync-config
+        # /etc/treesync is where the CLI looks by default, so no --config flag
+        # is needed. The file has to land as config.toml.
+        target: /etc/treesync/config.toml
+        mode: 0444
+
+    # Bind mounts, so the data is the node's own. `volumes:` below would give
+    # each task a fresh empty volume instead, which for a mirror means syncing
+    # into nothing.
+    volumes:
+      - type: bind
+        source: /srv/treesync/src
+        target: /data/src
+        # treesync never writes to its source; this makes that the kernel's
+        # guarantee rather than a promise.
+        read_only: true
+      - type: bind
+        source: /srv/treesync/dst
+        target: /data/dst
+
+    environment:
+      LOG_LEVEL: info
+
+    deploy:
+      # One. Two tasks would mirror the same source into the same target at the
+      # same time. Scaling this up is not a way to go faster.
+      replicas: 1
+
+      placement:
+        constraints:
+          # Bind mounts are node-local, so the task has to land on the node that
+          # actually holds the data. Without this the scheduler is free to start
+          # it anywhere and mirror an empty directory.
+          - node.labels.treesync-data == true
+          # Label the node first:
+          #   docker node update --label-add treesync-data=true <node>
+
+      restart_policy:
+        condition: any
+        delay: 5s
+
+      update_config:
+        # Stop the old task before starting the new one. The default starts the
+        # replacement first, which would briefly run two daemons against one
+        # target.
+        order: stop-first
+        failure_action: rollback
+
+      rollback_config:
+        order: stop-first
+
+      resources:
+        limits:
+          # Transfers stream, so memory tracks the number of entries in the
+          # index and not the size of the largest file.
+          memory: 256M
+        reservations:
+          memory: 64M
+
+    # Room for the shutdown flush. `watch` applies what it has already observed
+    # on SIGTERM; a shorter period turns a clean stop into a SIGKILL partway
+    # through writing a file.
+    stop_grace_period: 15s
+
+    healthcheck:
+      # Validates the config without touching either tree, so it is safe against
+      # a running daemon.
+      test: ["CMD", "treesync", "check"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+configs:
+  treesync-config:
+    # Swarm configs are immutable. Changing the config means creating a new
+    # object and updating the service to reference it, which is why the name
+    # carries a version. Bump both together.
+    name: treesync-config-v1
+    file: ./config/config.toml
+
+# To mirror to another host rather than a second bind mount, point the target at
+# ssh in config.toml and add the key as a secret:
+#
+#   secrets:
+#     treesync-ssh:
+#       name: treesync-ssh-v1
+#       file: ./ssh/id_ed25519
+#
+# and on the service:
+#
+#   secrets:
+#     - source: treesync-ssh
+#       target: /etc/treesync/ssh/id_ed25519
+#       mode: 0400
+#
+# OpenSSH refuses a key that is group or world readable, so the mode matters.
+# Nothing needs installing on the far host: treesync uploads its own binary as
+# the agent the first time it connects.

@@ -1,0 +1,136 @@
+name: "🛡️ Container image scan"
+
+# Scans an image that is already in GHCR, so it runs against the exact artifact
+# that will be deployed and published rather than a rebuild of it.
+on:
+  workflow_call:
+    inputs:
+      image_repository:
+        description: "Container image repository"
+        required: true
+        type: string
+
+      image_tag:
+        description: "Container image tag"
+        required: true
+        type: string
+
+      severity:
+        description: "Severities that fail the scan"
+        required: false
+        type: string
+        default: "HIGH,CRITICAL"
+
+      ignore_unfixed:
+        description: "Skip vulnerabilities with no released fix"
+        required: false
+        type: boolean
+        default: true
+
+      scanners:
+        description: "Trivy scanners to run (vuln, secret, misconfig, license)"
+        required: false
+        type: string
+        default: "vuln"
+
+  # Mirrors the workflow_call inputs so `inputs.*` resolves the same way on a
+  # manual run, which is how an already-published tag gets re-scanned when a
+  # new advisory lands without any code change.
+  workflow_dispatch:
+    inputs:
+      image_repository:
+        description: "Container image repository"
+        required: true
+        type: string
+
+      image_tag:
+        description: "Container image tag"
+        required: true
+        type: string
+
+      severity:
+        description: "Severities that fail the scan"
+        required: false
+        type: string
+        default: "HIGH,CRITICAL"
+
+      ignore_unfixed:
+        description: "Skip vulnerabilities with no released fix"
+        required: false
+        type: boolean
+        default: true
+
+      scanners:
+        description: "Trivy scanners to run (vuln, secret, misconfig, license)"
+        required: false
+        type: string
+        default: "vuln"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  trivy:
+    name: Trivy
+
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_REF: ${{ inputs.image_repository }}:${{ inputs.image_tag }}
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          # Trivy pulls the image itself rather than through the Docker daemon,
+          # so it needs the registry credentials directly. The built-in token
+          # is enough here because the image being scanned belongs to this
+          # repository.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          scan-type: image
+          scanners: ${{ inputs.scanners }}
+          severity: ${{ inputs.severity }}
+          # Unfixed CVEs are reported by the full-report step below but do not
+          # fail the gate: there is no action to take on them beyond waiting
+          # for the base image to carry a patch.
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          format: table
+          output: trivy-report.txt
+          exit-code: "1"
+
+      - name: Publish report
+        if: always()
+        run: |
+          {
+            echo "### Container scan: \`$IMAGE_REF\`"
+            echo
+            echo "Severities gated: \`${{ inputs.severity }}\`"
+            echo
+            echo '```'
+            if [[ -s trivy-report.txt ]]; then
+              cat trivy-report.txt
+            else
+              echo "No findings at the gated severities."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-report-${{ inputs.image_tag }}
+          path: trivy-report.txt
+          if-no-files-found: warn
+          retention-days: 30

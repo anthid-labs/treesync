@@ -1,0 +1,33 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+
+# Environment / secrets
+.env
+.env.*
+.envrc
+*.key
+*.pem
+**/secrets.tfvars
+**/secrets.*.tfvars
+
+# Python (ansible tooling)
+venv
+**/venv
+**/.venv
+**/__pycache__
+
+# Editors / agents
+.idea
+**/.idea
+.vscode
+.codex
+**/.codex
+.claude/settings.local.json
+
+# OS
+.DS_Store
+
+# Local config
+treesync.toml

@@ -1,0 +1,61 @@
+# Server A -> server B. Paths on the left of a bind mount are server A's;
+# everything named here is either a CONTAINER path or a path on server B.
+[[sync]]
+name = "app"
+
+# The container path the source bind mount lands on. Leave it alone and change
+# the mount in compose instead.
+source = "/data/src"
+
+# Batching window. Longer than the container-to-container test's 500ms because
+# a real link is worth batching harder for: one pass carrying ten changes beats
+# ten passes carrying one.
+delay = "2s"
+
+# Removals on A are removed from B. Off by default in treesync, and worth
+# thinking about before turning on: a source that is briefly unreadable looks
+# very much like one whose files were genuinely deleted.
+delete = true
+
+# "quick" compares size and mtime, one stat per file. "checksum" also compares
+# BLAKE3 content hashes, which catches a rewrite that left size and mtime
+# untouched but reads every candidate file on BOTH ends every pass. Start here;
+# move to checksum only if you actually see a missed change.
+verify = "quick"
+
+exclude = ["*.tmp", ".git/", "node_modules/", ".DS_Store"]
+
+  [sync.target]
+  type = "ssh"
+
+  # SERVER B. An IP, a DNS name, or a ~/.ssh/config alias.
+  host = "deploy@SERVER-B"
+  port = 22
+
+  # The destination tree on server B. Created if it does not exist.
+  path = "/srv/app"
+
+  # Container path: this is the ./example/two-server/ssh mount. treesync never
+  # reads key material into its config; this is a path and only a path.
+  identity_file = "/ssh/id_ed25519"
+
+  # agent_binary is deliberately absent.
+  #
+  # It defaults to whichever treesync is running, and the image's binary is a
+  # static musl build with no dynamic dependencies, so it runs on Ubuntu as-is
+  # (verified against ubuntu:24.04). Set it ONLY if A and B are different
+  # architectures -- an amd64 client shipping to an arm64 host -- in which case
+  # point it at a cross-built Linux binary for B's architecture.
+
+  # BatchMode=yes is forced by treesync and cannot be overridden: an
+  # interactive prompt on a stdin carrying a binary protocol hangs the sync
+  # instead of failing it. So an unknown host key is a hard failure, and
+  # known_hosts has to be populated by ssh-keyscan up front.
+  #
+  # GlobalKnownHostsFile=/dev/null keeps /etc/ssh/ssh_known_hosts from quietly
+  # participating in the decision.
+  ssh_options = [
+    "UserKnownHostsFile=/ssh/known_hosts",
+    "StrictHostKeyChecking=yes",
+    "GlobalKnownHostsFile=/dev/null",
+  ]

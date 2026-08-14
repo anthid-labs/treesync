@@ -1,0 +1,181 @@
+# treesync configuration.
+#
+# Every key is optional except a sync's name, source, and target. Unknown keys
+# are a startup error rather than a silently ignored setting, so a typo here
+# fails loudly instead of quietly not applying.
+
+# Note the config format is TOML, indentation thus is for readability or preference not for
+# syntax.
+
+# Inherited by every [[sync]] that does not set its own value.
+[defaults]
+# How long events are batched before treesync acts on them. Accepts "500ms", "2s",
+# "1m". Longer batches more work into one pass; shorter reduces lag.
+delay = "1s"
+
+# Distinct paths that force a flush before the delay elapses. Bounds how much
+# one pass can carry.
+max_pending = 10000
+
+# How closely two files are compared before deciding they match.
+#
+#   "quick"     size and modification time. One stat per file.
+#   "checksum"  also compare BLAKE3 content hashes.
+#
+# Quick is what rsync does without --checksum, and it misses a rewrite that
+# leaves size and timestamp untouched, which happens on filesystems with
+# one-second mtime granularity, and whenever content is restored with its
+# timestamp intact (cp -p, tar -x, touch -r).
+#
+# Checksum reads every candidate file on both sides, so its cost scales with
+# the data in scope, not the file count. It is also authoritative in the other
+# direction: it skips a transfer when only the timestamp moved.
+verify = "quick"
+
+# Which attributes are mirrored onto the target.
+#
+# Content, modification time and symlink targets are always replicated. A copy
+# that did not preserve mtime would re-transfer every file on every pass. These
+# two are optional:
+#
+#   mode       permission bits. On by default; a mirrored executable that
+#              arrives without its execute bit is not a useful mirror.
+#   ownership  uid and gid. Off by default: chown requires privilege, so an
+#              unprivileged process would report a failure per file that it can
+#              do nothing about. The uids also have to mean the same thing on
+#              both ends, which across hosts or containers they often do not.
+#
+# Hardlinks are NOT preserved: a file with two names is copied twice and arrives
+# as two independent files.
+preserve = { mode = true, ownership = false }
+
+# Whether paths removed from the source are removed from the target.
+#
+# Off by default, deliberately. The target is usually the copy without a backup,
+# and a source that is briefly unreadable is hard to distinguish from one whose
+# files were genuinely deleted.
+delete = false
+
+# Whether a changed file is sent whole, or only where it differs.
+#
+# Remote targets only. A local copy is already cheap, and comparing two files to
+# avoid copying one of them would cost more than the copy.
+#
+# The comparison uses a rolling checksum, which matters for the case a
+# block-by-block scheme gets wrong: an edit that changes a value's *length*
+# shifts every byte after it, and a rolling window still finds the target's
+# existing blocks at their new, unaligned offsets. Editing one field of a large
+# JSON document is exactly that case.
+#
+#   enabled     On. Turning it off restores whole-file transfers, which is the
+#               better trade only when the link is faster than the disks, since
+#               both ends read the whole file to work out what not to send.
+#   min_size    Files below this go whole. Under a megabyte or so, sending the
+#               file beats the round trip and the two reads it would take to
+#               avoid sending it.
+#   block_size  Omit to size it from the file (square root of its length,
+#               clamped to 16 KiB..128 KiB). A 1.5 GB file gets 64 KiB blocks,
+#               about 24k of them, so its signature is roughly half a megabyte.
+#
+# Every transfer, delta or whole, is verified end to end: the client sends
+# BLAKE3 of the source, the agent hashes what it reconstructed, and a mismatch
+# is refused rather than published. The file already on the target is never
+# replaced by something that did not match.
+delta = { enabled = true, min_size = 1048576 }
+
+
+# A local mirror: one directory on this machine copied to another.
+[[sync]]
+name = "www"
+source = "/var/www"
+
+# Patterns left out of the sync.
+#
+# Applied to BOTH trees. Excluding from only the source would make every
+# matching file on the target look like a deletion, and `delete = true` would
+# then remove exactly the files this was meant to protect.
+#
+#   *.tmp           matches at any depth, like .gitignore
+#   node_modules/   the directory and everything under it (slash optional)
+#   build/*.o       has a separator, so it is anchored at the source root
+#
+# Malformed patterns are a startup error, not a silent no-op.
+exclude = ["*.tmp", ".git/", "node_modules/"]
+
+  [sync.target]
+  type = "local"
+  path = "/backup/www"
+
+
+# A remote mirror over SSH. `type` is stated rather than guessed from which keys
+# are present, so a typo in `host` reports that key instead of "no variant
+# matched".
+[[sync]]
+name = "app"
+source = "/srv/app"
+
+# Overrides the defaults above for this sync only.
+delay = "5s"
+delete = true
+verify = "checksum"
+
+  [sync.target]
+  type = "ssh"
+  # user@host, or an alias from ~/.ssh/config.
+  host = "deploy@example.com"
+  path = "/srv/app"
+  port = 22
+  # Omit to use the agent's usual key lookup. treesync never reads a key's
+  # contents into its own config: this is a path, and only a path.
+  identity_file = "/root/.ssh/id_ed25519"
+
+  # Where the agent binary lives on the remote host.
+  #
+  # Nothing has to be installed there first: treesync connects, and if no
+  # usable agent answers it uploads one and connects again. The agent is the
+  # treesync binary itself, run as `treesync agent`, so there is no second
+  # artifact to build or keep in step.
+  #
+  # A relative path is taken from the login account's home directory, which is
+  # the one place it is certain to be able to write.
+  #
+  # An absolute path may point inside the target tree, and that is the layout
+  # to reach for when the host should be left exactly as it was found:
+  #
+  #   path       = "/srv/app"
+  #   agent_path = "/srv/app/.bin/treesync"
+  #
+  # Nothing then lives outside the mirrored directory, so removing that one
+  # directory removes treesync from the host, and nothing depends on the login
+  # account having a writable home. The parent is created by the upload, so
+  # .bin does not have to exist first.
+  #
+  # It does NOT need an `exclude` entry. treesync knows where its own binary
+  # is and never reports it as tree content, so a source that has no such file
+  # does not read as a target path to delete. Requiring the rule to be written
+  # out would mean an operator could leave it out, and leaving it out is silent
+  # until the pass that deletes the running agent.
+  agent_path = ".cache/treesync/treesync"
+
+  # The local build to install on the host.
+  #
+  # Defaults to whichever treesync is running, which is right when both ends
+  # are the same platform. Syncing from a mac to a Linux host is not: set this
+  # to a Linux build. `docker build --target builder` produces a static one.
+  #
+  # treesync reads the host's uname and the binary's own header before
+  # uploading, so a mismatch is one clear error rather than an exec failure
+  # arriving later as a closed connection.
+  agent_binary = "/usr/local/lib/treesync/treesync-linux-aarch64"
+
+  # Extra -o options for the ssh client, for everything ssh_config can express
+  # that has no key of its own.
+  #
+  # Needed more often than it looks: OpenSSH finds ~/.ssh/config through the
+  # password database rather than $HOME, so a service account cannot be pointed
+  # at a different config with an environment variable.
+  #
+  # BatchMode=yes is always set and cannot be overridden here. An interactive
+  # prompt on a stdin carrying a binary protocol hangs the sync instead of
+  # failing it.
+  ssh_options = ["ProxyJump=bastion.example.com"]
