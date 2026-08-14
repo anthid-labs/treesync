@@ -1,9 +1,11 @@
 # TreeSync
+[![🛡️ Container image scan](https://github.com/anthid-labs/treesync/actions/workflows/container-scan.yml/badge.svg)](https://github.com/anthid-labs/treesync/actions/workflows/container-scan.yml)
+[![🔐 static security analysis](https://github.com/anthid-labs/treesync/actions/workflows/security-static.yml/badge.svg)](https://github.com/anthid-labs/treesync/actions/workflows/security-static.yml)
+[![🏗️ Build and Push Docker Image](https://github.com/anthid-labs/treesync/actions/workflows/build-and-push.yml/badge.svg)](https://github.com/anthid-labs/treesync/actions/workflows/build-and-push.yml)
 
 One-way directory mirroring, in Rust. An experiment in replacing
 [lsyncd](https://github.com/lsyncd/lsyncd).
 
-[![🏗️ Build and Push Docker Image](https://github.com/anthid-labs/treesync/actions/workflows/build-and-push.yml/badge.svg)](https://github.com/anthid-labs/treesync/actions/workflows/build-and-push.yml)
 [![Crates.io](https://img.shields.io/crates/v/treesync.svg)](https://crates.io/crates/treesync)
 [![Docs.rs](https://docs.rs/treesync/badge.svg)](https://docs.rs/treesync)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
