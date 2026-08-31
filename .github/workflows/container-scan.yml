@@ -96,8 +96,15 @@ jobs:
           # repository.
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          # Silence the "a newer Trivy is available" notice: the scanner is
+          # pinned below, so an upgrade is a deliberate bump in this file
+          # rather than something to be told about on every run.
+          TRIVY_SKIP_VERSION_CHECK: "true"
         with:
           image-ref: ${{ env.IMAGE_REF }}
+          # The action's bundled default trails the Trivy release by several
+          # versions, so pin the scanner here and bump it deliberately.
+          version: v0.74.0
           scan-type: image
           scanners: ${{ inputs.scanners }}
           severity: ${{ inputs.severity }}
