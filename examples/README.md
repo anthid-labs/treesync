@@ -26,6 +26,15 @@ into a SIGKILL partway through writing a file, so each example sets one.
 **Source and target may not overlap.** treesync rejects that at startup, since
 writing into the watched tree would feed the sync its own writes.
 
+**Metrics bind `0.0.0.0` inside a container.** `127.0.0.1` is the container's
+own loopback, so a scraper outside it could never connect. Each example
+therefore sets `listen = "0.0.0.0:9099"` in the config and controls reachability
+at the layer above: Compose publishes it on the host's loopback, Swarm uses a
+host-mode port so scrapes are not load balanced across tasks, and the Kubernetes
+pod is reachable only inside the cluster. The endpoint has no authentication and
+it names every sync, its source and its target, so do not put it on a public
+interface. Only `watch` serves it.
+
 **inotify limits come from the host kernel.** `max_user_watches` and
 `max_queued_events` are shared by every container on the node. Exhausting them
 costs a re-walk and not correctness, but the fix is on the host:

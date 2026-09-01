@@ -23,6 +23,15 @@ data:
   # Mounted at /etc/treesync, which is where the CLI looks by default, so the
   # container needs no --config flag. The file has to be named config.toml.
   config.toml: |
+    # Prometheus metrics, served by `watch` only. 0.0.0.0 rather than a
+    # loopback address: inside a pod, 127.0.0.1 is the container's own
+    # loopback, so a scraper on another pod could never reach it. The endpoint
+    # has no authentication and it names every sync, so reach it through the
+    # cluster rather than exposing it, and put a NetworkPolicy in front of it
+    # if the namespace has one.
+    [metrics]
+    listen = "0.0.0.0:9099"
+
     [[sync]]
     name = "app"
     source = "/data/src"
@@ -140,6 +149,13 @@ spec:
         # Rolls the pod when the config changes. Without this, editing the
         # ConfigMap updates the file on disk but nothing rereads it.
         checksum/config: replace-me-or-use-a-templating-tool
+
+        # For a Prometheus that discovers pods by annotation. With the
+        # Prometheus Operator, delete these and add a ServiceMonitor pointing
+        # at the `metrics` port below instead.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9099"
+        prometheus.io/path: /metrics
     spec:
       # Enough for the shutdown flush. treesync applies what it has already
       # observed on SIGTERM; a shorter period turns that into a SIGKILL partway
@@ -212,6 +228,13 @@ spec:
           # The image has no default command on purpose: `sync` would mutate the
           # target the moment the container started.
           args: ["watch"]
+
+          # Named so a ServiceMonitor or a Service can refer to it by name
+          # rather than repeating the number.
+          ports:
+            - name: metrics
+              containerPort: 9099
+              protocol: TCP
 
           env:
             - name: LOG_LEVEL

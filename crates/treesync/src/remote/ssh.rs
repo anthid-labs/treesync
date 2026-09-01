@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,7 +37,7 @@ use super::protocol::{
 };
 use crate::error::{Error, Result};
 use crate::reconcile::{Index, IndexOptions, Metadata, Preserve, Scope};
-use crate::sink::Sink;
+use crate::sink::{Sink, TransferStats};
 
 /// How long to wait for the TCP connection and the SSH banner.
 ///
@@ -400,12 +401,8 @@ pub struct SshSink {
     reconnect: Reconnect,
     /// When to send only what differs instead of the whole file.
     delta: delta::Options,
-    /// File content bytes put on the wire, whole-file and literal alike.
-    ///
-    /// The figure that actually says whether a delta is earning its keep: not
-    /// how large the files were, but how much of them had to cross the link.
-    /// Counted for both paths so the two are directly comparable.
-    sent: std::sync::atomic::AtomicU64,
+    /// What has crossed this link, for [`Sink::transfer_stats`].
+    transferred: Transferred,
     /// Breaks the retry loop when the process is shutting down.
     ///
     /// Without it, `watch` told to stop during an outage would sit in a
@@ -471,14 +468,33 @@ impl SshSink {
             reopen,
             reconnect: Reconnect::never(),
             delta: delta::Options::default(),
-            sent: std::sync::atomic::AtomicU64::new(0),
+            transferred: Transferred::default(),
             cancel: CancellationToken::new(),
         }
     }
 
     /// File content bytes sent so far, across every transfer on this link.
     pub fn bytes_sent(&self) -> u64 {
-        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+        self.transferred.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records a completed transfer.
+    ///
+    /// `logical` is the size of the file and `sent` is how much of it had to
+    /// cross the link. Keeping both is the whole point: the ratio between them
+    /// is what says whether the delta is earning its keep, and neither number
+    /// alone says anything about that.
+    fn record_transfer(&self, method: TransferMethod, sent: u64, logical: u64) {
+        self.transferred.bytes.fetch_add(sent, Ordering::Relaxed);
+        self.transferred
+            .logical_bytes
+            .fetch_add(logical, Ordering::Relaxed);
+
+        match method {
+            TransferMethod::Whole => &self.transferred.whole_files,
+            TransferMethod::Delta => &self.transferred.delta_files,
+        }
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sets when a changed file is sent as a delta rather than whole.
@@ -567,6 +583,8 @@ impl SshSink {
 
             match self.reopen.open(&self.description).await {
                 Ok(fresh) => {
+                    self.transferred.reconnects.fetch_add(1, Ordering::Relaxed);
+
                     tracing::info!(
                         agent = %self.description,
                         attempt,
@@ -1099,6 +1117,34 @@ fn unreachable_agent(description: &str, error: Error) -> Error {
     ))
 }
 
+/// A link's running totals.
+///
+/// `Relaxed` throughout, like the local sink's: these are read for reporting,
+/// and nothing is ordered against them.
+#[derive(Debug, Default)]
+struct Transferred {
+    /// File content bytes put on the wire, whole-file and literal alike.
+    ///
+    /// The figure that actually says whether a delta is earning its keep: not
+    /// how large the files were, but how much of them had to cross the link.
+    /// Counted for both paths so the two are directly comparable.
+    bytes: AtomicU64,
+    /// Size of the files those transfers covered.
+    logical_bytes: AtomicU64,
+    whole_files: AtomicU64,
+    delta_files: AtomicU64,
+    /// Rebuilt connections. A link that flaps shows up here long before it
+    /// shows up as a failure, since every action is retried across a reconnect.
+    reconnects: AtomicU64,
+}
+
+/// Which path a file took to the target.
+#[derive(Debug, Clone, Copy)]
+enum TransferMethod {
+    Whole,
+    Delta,
+}
+
 #[async_trait]
 impl Sink for SshSink {
     async fn index(&self, scope: &Scope, options: &IndexOptions) -> Result<Index> {
@@ -1145,8 +1191,12 @@ impl Sink for SshSink {
         loop {
             match send_file(&mut connection, source, relative).await {
                 Ok(sent) => {
-                    self.sent
-                        .fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
+                    // Everything read from the file was sent, so the two
+                    // numbers are the same here. Recorded as both anyway, so a
+                    // whole-file transfer shows up in the totals a delta is
+                    // measured against rather than skewing the ratio by being
+                    // absent from one side of it.
+                    self.record_transfer(TransferMethod::Whole, sent, sent);
 
                     return Ok(());
                 }
@@ -1216,8 +1266,7 @@ impl Sink for SshSink {
         loop {
             match send_patch(&mut connection, source, relative, &signature, resume_from).await {
                 Ok(sent) => {
-                    self.sent
-                        .fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
+                    self.record_transfer(TransferMethod::Delta, sent, length);
 
                     tracing::debug!(
                         path = %relative.display(),
@@ -1289,6 +1338,16 @@ impl Sink for SshSink {
             preserve: WirePreserve::new(preserve),
         })
         .await
+    }
+
+    fn transfer_stats(&self) -> TransferStats {
+        TransferStats {
+            bytes: self.transferred.bytes.load(Ordering::Relaxed),
+            logical_bytes: self.transferred.logical_bytes.load(Ordering::Relaxed),
+            whole_files: self.transferred.whole_files.load(Ordering::Relaxed),
+            delta_files: self.transferred.delta_files.load(Ordering::Relaxed),
+            reconnects: self.transferred.reconnects.load(Ordering::Relaxed),
+        }
     }
 }
 

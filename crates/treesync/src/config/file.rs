@@ -26,6 +26,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -48,6 +49,50 @@ pub struct Config {
     /// One entry per `[[sync]]` block.
     #[serde(rename = "sync", default)]
     pub syncs: Vec<Sync>,
+
+    /// Where to serve metrics from, if anywhere.
+    #[serde(default)]
+    pub metrics: Metrics,
+}
+
+/// The metrics endpoint.
+///
+/// Off unless an address is given. A daemon that opened a port nobody asked
+/// for would be a surprise on any host where one is already taken, and the
+/// listener is the only part of this that is not free.
+///
+/// Pull, not push. Prometheus scrapes this; nothing has to be run alongside
+/// treesync to collect from it, which is the same rule the rest of the daemon
+/// follows.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// `host:port` to serve `/metrics` on, such as `127.0.0.1:9099`.
+    ///
+    /// A string rather than a parsed address so a malformed one is reported
+    /// with the file and the value in the message, the way every other config
+    /// error here is. [`Metrics::listen_addr`] does the parsing, and loading a
+    /// config calls it, so a typo is a startup failure rather than something
+    /// discovered on the first scrape.
+    ///
+    /// Bind to a loopback address unless the scraper is on another host. The
+    /// endpoint has no authentication, and it names every sync, its source and
+    /// its target.
+    pub listen: Option<String>,
+}
+
+impl Metrics {
+    /// The address to bind, or `None` when metrics are off.
+    pub fn listen_addr(&self) -> Result<Option<SocketAddr>> {
+        let Some(listen) = &self.listen else {
+            return Ok(None);
+        };
+
+        listen
+            .parse()
+            .map(Some)
+            .map_err(|err| Error::Config(format!("metrics.listen {listen:?}: {err}")))
+    }
 }
 
 /// Values inherited by every sync block.
@@ -295,6 +340,10 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        // Before the syncs, so a bad address is reported even in a config that
+        // also has something else wrong with it.
+        self.metrics.listen_addr()?;
+
         if self.syncs.is_empty() {
             return Err(Error::Config(
                 "no [[sync]] blocks: treesync would have nothing to do".to_string(),
@@ -430,6 +479,52 @@ source = "/var/www"
             Err(other) => panic!("expected a config error, got {other:?}"),
             Ok(_) => panic!("expected this config to be rejected"),
         }
+    }
+
+    #[test]
+    fn metrics_are_off_unless_an_address_is_given() {
+        let config = parse(MINIMAL);
+
+        assert_eq!(config.metrics.listen, None);
+        assert_eq!(config.metrics.listen_addr().expect("valid"), None);
+    }
+
+    #[test]
+    fn a_metrics_address_is_parsed() {
+        let config = parse(&format!(
+            "{MINIMAL}\n[metrics]\nlisten = \"127.0.0.1:9099\"\n"
+        ));
+
+        assert_eq!(
+            config.metrics.listen_addr().expect("valid"),
+            Some("127.0.0.1:9099".parse().expect("a literal address"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_metrics_address_is_rejected_at_load() {
+        // Not on the first scrape, by which time the daemon is running and
+        // looks healthy.
+        let message = reject(&format!(
+            "{MINIMAL}\n[metrics]\nlisten = \"not-an-address\"\n"
+        ));
+
+        assert!(message.contains("metrics.listen"), "{message}");
+        assert!(message.contains("not-an-address"), "{message}");
+    }
+
+    #[test]
+    fn a_metrics_address_with_no_port_is_rejected() {
+        let message = reject(&format!("{MINIMAL}\n[metrics]\nlisten = \"127.0.0.1\"\n"));
+
+        assert!(message.contains("metrics.listen"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_metrics_key_is_rejected() {
+        let message = reject(&format!("{MINIMAL}\n[metrics]\nport = 9099\n"));
+
+        assert!(message.contains("port"), "{message}");
     }
 
     #[test]

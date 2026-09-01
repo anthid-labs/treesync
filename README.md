@@ -20,6 +20,10 @@ is still missing.
 What that costs, measured on a 210 MB JSON document with a single field edited:
 **27 KB on the wire**, and the target byte-identical to the source.
 
+It reports on itself: set `[metrics] listen` and `watch` serves Prometheus on
+it, covering tree size, pass and diff timings, sync lag, action counts and how
+much of each file actually crossed the link. See [Metrics](#metrics).
+
 How it behaves when the disk fills, the link goes, or a path cannot be read is
 documented in [Behaviour when things go wrong](#behaviour-when-things-go-wrong)
 instead of left to be discovered. Each of those conditions has a test that
@@ -127,7 +131,7 @@ silently never applied.
 
 | Key                    | Default    | Purpose                                                     |
 | ---------------------- | ---------- | ----------------------------------------------------------- |
-| `name`                 | *required* | Identifies the sync in logs. Must be unique.                 |
+| `name`                 | *required* | Identifies the sync in logs and metrics. Must be unique.     |
 | `source`               | *required* | Absolute path to the watched tree.                           |
 | `target.type`          | *required* | `local` or `ssh`.                                            |
 | `target.path`          | *required* | Absolute destination path.                                   |
@@ -143,6 +147,12 @@ silently never applied.
 | `delta.block_size`     | *derived*  | Signature block size. Defaults to √length, 16 KiB to 128 KiB. |
 
 Anything in `[defaults]` applies to every `[[sync]]` that does not override it.
+
+One key sits outside the sync blocks, since it is a property of the process:
+
+| Key              | Default | Purpose                                                   |
+| ---------------- | ------- | --------------------------------------------------------- |
+| `metrics.listen` | *unset* | `host:port` to serve Prometheus metrics on. Off when unset. |
 
 A few behaviours to know before trusting it with data:
 
@@ -165,6 +175,7 @@ A few behaviours to know before trusting it with data:
 | `TREESYNC_CONFIG` | Config path. Same as `--config`. Defaults to `/etc/treesync/config.toml`. |
 | `RUST_LOG`        | Log filter. Takes precedence over `--log-level`.               |
 | `LOG_LEVEL`       | Fallback filter when `RUST_LOG` is unset.                      |
+| `TREESYNC_METRICS_LISTEN` | Metrics address. Same as `--metrics-listen`, and wins over `[metrics] listen`. |
 
 A malformed filter is a startup failure, not silently dropped logs.
 
@@ -454,6 +465,117 @@ Shutdown stays bounded under all of this. `watch` stops on SIGTERM or SIGINT
 after flushing what it has already observed, and a shutdown during an outage does
 not wait out the reconnect interval.
 
+## Metrics
+
+Off unless asked for. Set an address and `watch` serves the Prometheus text
+format on it:
+
+```toml
+[metrics]
+listen = "127.0.0.1:9099"
+```
+
+Or per invocation, which wins over the file:
+
+```bash
+treesync --metrics-listen 127.0.0.1:9099 watch
+```
+
+Only `watch` serves them. `sync` and `check` exit, and an endpoint that stops
+existing before Prometheus can reach it produces a series full of holes. A port
+that cannot be bound fails startup, because a daemon that came up quietly
+without its metrics looks exactly like one that is working.
+
+Bind a loopback address unless the scraper is on another host. There is no
+authentication, and the endpoint names every sync.
+
+### What is published
+
+Every series is labelled `sync`, the `name` from its block. Paths are never
+labels: one series per file is how a metrics backend gets taken down by the
+thing meant to be watching it.
+
+| Metric | Type | Labels | What it is |
+| ------ | ---- | ------ | ---------- |
+| `treesync_build_info` | gauge | `version` | Always 1. The labels are the point. |
+| `treesync_sync_passes_total` | counter | `scope` | Passes started. `scope` is `full`, `subtree` or `paths`. |
+| `treesync_sync_pass_duration_seconds` | histogram | `scope` | End to end. `scope="full"` is the whole-tree time. |
+| `treesync_sync_pass_failures_total` | counter | `scope` | Passes abandoned because a tree could not be read. |
+| `treesync_sync_last_success_timestamp_seconds` | gauge | | Unix time of the last pass with no failed action. |
+| `treesync_sync_in_progress` | gauge | | 1 while a pass is running. |
+| `treesync_index_duration_seconds` | histogram | `side` | Walking one tree. `side` is `source` or `target`. |
+| `treesync_plan_duration_seconds` | histogram | | The diff alone, with no I/O in it. |
+| `treesync_apply_duration_seconds` | histogram | | Applying a plan, which is where transfers happen. |
+| `treesync_tree_entries` | gauge | `side` | Entries seen on the last whole-tree pass. |
+| `treesync_tree_bytes` | gauge | `side` | File content on the last whole-tree pass. |
+| `treesync_tree_walk_timestamp_seconds` | gauge | | When those two were last refreshed. |
+| `treesync_plan_actions_total` | counter | `action` | Actions planned, by kind. |
+| `treesync_actions_applied_total` | counter | `action` | Actions that succeeded. |
+| `treesync_actions_failed_total` | counter | `action` | Actions that failed. Retried, not lost. |
+| `treesync_batches_total` | counter | `kind` | Batches off the queue. `kind` is `changes` or `rescan`. |
+| `treesync_batch_paths` | histogram | | Distinct paths per batch. |
+| `treesync_queue_pending` | gauge | | Observed but not yet batched. |
+| `treesync_sync_lag_seconds` | histogram | | First event of a batch to that batch being applied. |
+| `treesync_retry_paths` | gauge | | Paths awaiting another attempt. |
+| `treesync_retry_dropped_total` | counter | | Paths given up on because too many were failing. |
+| `treesync_transfer_bytes_total` | counter | | Content written, or put on the wire. |
+| `treesync_transfer_logical_bytes_total` | counter | | Size of the files those transfers covered. |
+| `treesync_transfer_files_total` | counter | `method` | Files transferred. `method` is `whole` or `delta`. |
+| `treesync_remote_reconnects_total` | counter | | Times a link dropped and was rebuilt. |
+
+`action` is one of `create_dir`, `copy_file`, `create_symlink`, `remove`,
+`rename`, `set_metadata`. A kind that has not happened yet has no series; the
+name is still described in the scrape.
+
+### Reading it
+
+Rates are not published, they are derived. A gauge holding "files per second"
+would be treesync's own average over a window nobody chose, and would be wrong
+the moment a scrape was missed.
+
+```promql
+# Files per second, and bytes per second.
+rate(treesync_actions_applied_total{action="copy_file"}[5m])
+rate(treesync_transfer_bytes_total[5m])
+
+# Time since the last successful sync, in seconds.
+time() - treesync_sync_last_success_timestamp_seconds
+
+# What the delta is saving: the fraction of bytes not sent.
+1 - rate(treesync_transfer_bytes_total[1h])
+  / rate(treesync_transfer_logical_bytes_total[1h])
+
+# How long a whole-tree pass takes, 95th percentile.
+histogram_quantile(0.95,
+  rate(treesync_sync_pass_duration_seconds_bucket{scope="full"}[1h]))
+
+# How far behind the mirror runs. Floors at `delay`, which is in the window.
+histogram_quantile(0.95, rate(treesync_sync_lag_seconds_bucket[5m]))
+
+# A sync that has stopped keeping up: work still queued after a batch landed.
+treesync_queue_pending > 0
+```
+
+Two things worth knowing before alerting on these:
+
+- **`treesync_sync_last_success_timestamp_seconds` moves on an empty pass.** A
+  mirror that agrees with its source has synced successfully. If it did not
+  move, every healthy sync would eventually look stalled.
+- **The tree gauges only refresh on a whole-tree pass**, which for a daemon
+  means startup and any rescan after an event gap. An incremental batch indexes
+  the handful of paths it was told about, and publishing that as the tree's size
+  would collapse the gauge every time one file changed.
+  `treesync_tree_walk_timestamp_seconds` is how old they are.
+
+### Embedding
+
+The library records through the [`metrics`](https://docs.rs/metrics) facade and
+installs no recorder, the same split as `tracing`. With nothing installed each
+call is a branch on an atomic. A program embedding `treesync` installs whatever
+recorder it already uses and gets the same measurements; the Prometheus listener
+lives in the CLI, since installing a recorder is a process-wide decision only
+the binary at the top of the stack gets to make.
+
 ## Docker
 
 ```bash
@@ -519,16 +641,16 @@ Two container-specific things to know:
 | Path                 | Purpose                                                        |
 | -------------------- | -------------------------------------------------------------- |
 | `crates/treesync`    | The library: watcher, queue, reconciler, sinks, remote agent.   |
-| `apps/treesync-cli`  | The `treesync` binary: argument parsing and logging setup.      |
+| `apps/treesync-cli`  | The `treesync` binary: argument parsing, logging, the metrics endpoint. |
 | `examples/`          | Deployment examples: Compose, Kubernetes, Docker Swarm.         |
 | `docker/`            | Dockerfile, the development compose file, and the sshd test.    |
 | `.github/workflows/` | Lint, test, security scans, image publishing, the crates.io release. |
 
 The split is along process boundaries. Anything that decides or moves data is in
 the library, so it can be embedded and tested without a binary; the CLI is
-argument parsing, the global log subscriber, and an exit code. A library that
-installed a global subscriber would fight whatever its host application had
-already set up, which is why that lives in the binary.
+argument parsing, the global log subscriber and metrics recorder, and an exit
+code. A library that installed either would fight whatever its host application
+had already set up, which is why both live in the binary.
 
 Workspace members are globbed, so a new crate under `apps/` or `crates/` is
 picked up without editing the root `Cargo.toml`. Shared dependency versions live
@@ -601,6 +723,10 @@ to say so:
 - **Move optimisation.** A rename is re-transferred instead of moved in place.
   The queue pairs rename halves where the backend supplies cookies (inotify
   does, FSEvents does not), but nothing consumes that yet.
+- **Metrics from one-shot runs.** Only `watch` serves them, so a `sync` run
+  from cron records its measurements into a recorder nothing is scraping. A
+  push gateway would fix that at the cost of a service to operate alongside a
+  daemon whose point is not having any.
 
 ## Contributing
 

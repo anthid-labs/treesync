@@ -17,6 +17,11 @@ services:
     # killed midway through writing a file.
     stop_grace_period: 15s
 
+    # Metrics, when running `up` with `command: watch`. Bound to the host's
+    # loopback: the endpoint has no authentication.
+    ports:
+      - "127.0.0.1:9099:9099"
+
     volumes:
       - ./example/config:/etc/treesync:ro
       - ./example/src:/data/src

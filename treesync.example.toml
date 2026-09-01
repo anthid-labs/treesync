@@ -7,6 +7,25 @@
 # Note the config format is TOML, indentation thus is for readability or preference not for
 # syntax.
 
+# Prometheus metrics.
+#
+# Off unless an address is set here. Only `treesync watch` serves them: `sync`
+# and `check` exit, and an endpoint that stops existing before Prometheus can
+# reach it produces a series full of holes.
+#
+# Pull, not push. Prometheus scrapes this address; nothing has to run alongside
+# treesync to collect from it.
+#
+# Bind a loopback address unless the scraper is on another host. There is no
+# authentication, and the endpoint names every sync.
+#
+# A port that cannot be bound fails startup, deliberately: a daemon that came
+# up quietly without its metrics looks exactly like one that is working.
+#
+# --metrics-listen, or TREESYNC_METRICS_LISTEN, overrides this.
+# [metrics]
+# listen = "127.0.0.1:9099"
+
 # Inherited by every [[sync]] that does not set its own value.
 [defaults]
 # How long events are batched before treesync acts on them. Accepts "500ms", "2s",

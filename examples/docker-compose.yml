@@ -9,6 +9,9 @@
 # sample that drifts from the thing it claims to copy is worse than no sample,
 # because the copied version is the one that runs.
 #
+#   [metrics]
+#   listen = "0.0.0.0:9099"
+#
 #   [[sync]]
 #   name = "app"
 #   source = "/data/src"
@@ -50,6 +53,12 @@ services:
     # grace is 5s, so this leaves headroom rather than killing it midway through
     # writing a file.
     stop_grace_period: 15s
+
+    # Prometheus metrics, from `[metrics] listen` in config.toml. Bound to the
+    # host's loopback rather than published on every interface: the endpoint has
+    # no authentication and it names every sync, its source and its target.
+    ports:
+      - "127.0.0.1:9099:9099"
 
     volumes:
       # Mounted read-only at the CLI's default config location, so no --config

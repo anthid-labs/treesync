@@ -1,4 +1,11 @@
 # Matches the volume layout in compose.yaml.
+
+# 0.0.0.0, not a loopback address: inside a container 127.0.0.1 is the
+# container's own loopback and nothing outside could reach it. compose.yaml
+# publishes this on the host's loopback only.
+[metrics]
+listen = "0.0.0.0:9099"
+
 [[sync]]
 name = "example"
 source = "/data/src"

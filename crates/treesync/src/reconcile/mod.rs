@@ -25,7 +25,7 @@ mod action;
 mod filter;
 mod index;
 
-pub use action::{Action, Plan};
+pub use action::{Action, ActionCounts, Plan};
 pub use filter::Filter;
 pub use index::{Entry, Index, Metadata, index_scope, stat_paths, walk, walk_subtree};
 

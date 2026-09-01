@@ -14,7 +14,9 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::error::{Error, Result};
-use crate::reconcile::{Action, Index, IndexOptions, Metadata, Plan, Preserve, Scope};
+use crate::reconcile::{
+    Action, ActionCounts, Index, IndexOptions, Metadata, Plan, Preserve, Scope,
+};
 
 /// Somewhere a plan can be applied.
 ///
@@ -84,13 +86,54 @@ pub trait Sink: Send + Sync {
         metadata: &Metadata,
         preserve: Preserve,
     ) -> Result<()>;
+
+    /// Everything this sink has moved since it was opened.
+    ///
+    /// On the trait because only the sink knows what a transfer cost: a local
+    /// copy moves the whole file, and a remote one may have sent a few blocks
+    /// of it. Counted here rather than derived from the plan for the same
+    /// reason, since a plan says which files change and not how much of each
+    /// had to cross the link.
+    ///
+    /// Cumulative and monotonic, so a caller publishing it can set a counter
+    /// to it outright instead of tracking deltas between calls.
+    fn transfer_stats(&self) -> TransferStats {
+        TransferStats::default()
+    }
+}
+
+/// What a sink has moved, since it was opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransferStats {
+    /// File content actually written, or actually put on the wire.
+    pub bytes: u64,
+
+    /// Size of the files those transfers covered.
+    ///
+    /// Equal to `bytes` for a local sink, which copies whole files. For a
+    /// remote one the gap between the two is what the delta saved.
+    pub logical_bytes: u64,
+
+    /// Files sent or copied in full.
+    pub whole_files: u64,
+
+    /// Files sent as a delta against the copy the target already held.
+    pub delta_files: u64,
+
+    /// Times the link dropped and was rebuilt. Always zero for a local sink.
+    pub reconnects: u64,
 }
 
 /// What happened when a plan was applied.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ApplyReport {
-    /// Actions that succeeded.
-    pub applied: usize,
+    /// Actions that succeeded, by kind.
+    ///
+    /// A breakdown rather than a total because the total does not distinguish
+    /// a pass that copied fifty files from one that removed fifty.
+    /// [`ActionCounts::total`] is still the single number where that is all
+    /// that is wanted.
+    pub applied: ActionCounts,
     /// Actions that did not, with the reason.
     pub failures: Vec<ApplyFailure>,
 }
@@ -102,8 +145,28 @@ pub struct ApplyFailure {
 }
 
 impl ApplyReport {
+    /// Nothing to do, and so nothing that could have failed.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     pub fn is_complete(&self) -> bool {
         self.failures.is_empty()
+    }
+
+    /// Actions that failed, by kind.
+    ///
+    /// Derived rather than stored: the failures are kept in full so the caller
+    /// can retry exactly those paths, and counting them is cheap next to the
+    /// I/O that produced them.
+    pub fn failed(&self) -> ActionCounts {
+        let mut counts = ActionCounts::default();
+
+        for failure in &self.failures {
+            counts.record(&failure.action);
+        }
+
+        counts
     }
 
     /// Paths that did not make it, for the caller to retry.
@@ -130,10 +193,7 @@ pub async fn apply(
     sink: &dyn Sink,
     preserve: Preserve,
 ) -> ApplyReport {
-    let mut report = ApplyReport {
-        applied: 0,
-        failures: Vec::new(),
-    };
+    let mut report = ApplyReport::empty();
 
     for action in &plan.actions {
         let outcome = match action {
@@ -148,7 +208,7 @@ pub async fn apply(
         };
 
         match outcome {
-            Ok(()) => report.applied += 1,
+            Ok(()) => report.applied.record(action),
             Err(error) => {
                 tracing::warn!(
                     path = %action.path().display(),
@@ -165,7 +225,7 @@ pub async fn apply(
     }
 
     tracing::debug!(
-        applied = report.applied,
+        applied = report.applied.total(),
         failed = report.failures.len(),
         "applied plan"
     );
