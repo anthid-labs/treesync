@@ -131,9 +131,17 @@ jobs:
     name: Prepare Docker build context
     runs-on: ubuntu-latest
     needs: lint-and-test
-    # Nothing downstream of here runs for a pull request, so the tag derivation
-    # is skipped too rather than computing tags no job will use.
-    if: github.event_name != 'pull_request'
+    # The one gate on the whole build and publish chain. Everything that pushes
+    # an image or a crate hangs off this job, so a condition here is what keeps
+    # a branch, a fork or a pull request from producing a release.
+    #
+    # A merge to main arrives as a push to `refs/heads/main`; there is no merge
+    # event to key on. `workflow_dispatch` is allowed alongside it, but only on
+    # main, so a failed publish can be re-run without an empty commit. A
+    # dispatch from any other branch gets the tests and stops here.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@v6
 
@@ -266,14 +274,15 @@ jobs:
 
   container-scan:
     name: Scan image
-    # Runs against the amd64 arch tag rather than the merged manifest, because
-    # that tag exists before the manifest does. Scanning here is what lets a
-    # vulnerable build stop short of `latest`: the arch tags are intermediate,
-    # but the manifest below is what anyone actually pulls.
+    # Report only, and deliberately not a dependency of anything below. It runs
+    # beside the manifest push rather than in front of it, so a CVE in the base
+    # image cannot hold a release: the findings land in the run summary and an
+    # artifact, and the decision about them is a person's.
     #
-    # Only amd64 is scanned. Both arches install the same apk set on the same
-    # base, so the package surface Trivy reports is the same one; a per-arch
-    # difference would have to come from the base image itself.
+    # Runs against the amd64 arch tag rather than the merged manifest, because
+    # that tag exists first. Only amd64 is scanned: both arches install the same
+    # apk set on the same base, so the package surface is the same one, and a
+    # per-arch difference would have to come from the base image itself.
     needs:
       - prepare
       - build-and-push-amd64
@@ -285,11 +294,13 @@ jobs:
   merge-manifests:
     name: Publish multi-arch manifest
     runs-on: ubuntu-latest
+    # `container-scan` is not here on purpose. It is report only, so waiting on
+    # it would mean a broken scanner, or a slow one, delaying or blocking a
+    # release it has no say over.
     needs:
       - prepare
       - build-and-push-arm
       - build-and-push-amd64
-      - container-scan
     steps:
       - uses: docker/setup-buildx-action@v4
 
@@ -320,9 +331,13 @@ jobs:
     needs:
       - lint-and-test
       - merge-manifests
-    # Never from a pull request, and never from a branch. A fork opening a PR
-    # would otherwise reach a job holding the publish token.
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Redundant with the gate on `prepare`, which everything here descends
+    # from, and kept anyway: this is the job holding the crates.io token, and a
+    # second guard on it costs nothing. Worded identically so the two cannot
+    # drift into meaning different things.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@v6
 
