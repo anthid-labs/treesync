@@ -567,6 +567,47 @@ Two things worth knowing before alerting on these:
   would collapse the gauge every time one file changed.
   `treesync_tree_walk_timestamp_seconds` is how old they are.
 
+### Shipping it to a collector
+
+treesync serves metrics; it never pushes them, and it reads no
+`OTEL_EXPORTER_OTLP_ENDPOINT`. The scrape endpoint is the whole integration
+surface. Anything that reads Prometheus can take it from there, including a
+collector that forwards over OTLP, which is how these reach an OTLP backend
+without treesync having to speak OTLP itself.
+
+Grafana Alloy:
+
+```alloy
+prometheus.scrape "treesync" {
+  targets = [
+    { __address__ = "127.0.0.1:9099", instance = constants.hostname },
+  ]
+
+  job_name   = "treesync"
+  forward_to = [otelcol.receiver.prometheus.default.receiver]
+}
+```
+
+OpenTelemetry Collector:
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: treesync
+          static_configs:
+            - targets: ["127.0.0.1:9099"]
+```
+
+The collector owns retention, whatever labels it adds, and where the data ends
+up. treesync's side of it is one port.
+
+One thing to get right when treesync is in a container and the collector is not:
+`listen` has to be `0.0.0.0:9099` and the port published, because `127.0.0.1`
+inside a container is the container's own loopback and the collector cannot
+reach it. See [`examples/`](examples) for what each runtime needs.
+
 ### Embedding
 
 The library records through the [`metrics`](https://docs.rs/metrics) facade and
@@ -727,6 +768,11 @@ to say so:
   from cron records its measurements into a recorder nothing is scraping. A
   push gateway would fix that at the cost of a service to operate alongside a
   daemon whose point is not having any.
+- **OTLP.** Nothing is pushed and no `OTEL_EXPORTER_OTLP_ENDPOINT` is read. A
+  collector scraping the endpoint covers the usual case, so this matters only
+  where nothing can reach the daemon to scrape it. Traces would be the better
+  reason to close it: those have no pull equivalent, and the seam is already
+  there in the CLI's telemetry provider.
 
 ## Contributing
 
