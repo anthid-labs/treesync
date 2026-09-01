@@ -2,6 +2,15 @@ name: "🛡️ Container image scan"
 
 # Scans an image that is already in GHCR, so it runs against the exact artifact
 # that will be deployed and published rather than a rebuild of it.
+#
+# Report only. Findings are published to the run summary and kept as an
+# artifact, and none of them fail this workflow or hold up a publish. The
+# caller reflects that by not making this job a dependency of the manifest
+# push, so the two run side by side.
+#
+# The scanner failing is still a failure. That is the scan not having happened,
+# which is worth seeing, and is a different thing from the scan finding
+# something.
 on:
   workflow_call:
     inputs:
@@ -16,7 +25,7 @@ on:
         type: string
 
       severity:
-        description: "Severities that fail the scan"
+        description: "Severities to report"
         required: false
         type: string
         default: "HIGH,CRITICAL"
@@ -49,7 +58,7 @@ on:
         type: string
 
       severity:
-        description: "Severities that fail the scan"
+        description: "Severities to report"
         required: false
         type: string
         default: "HIGH,CRITICAL"
@@ -88,6 +97,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image
+        id: scan
         uses: aquasecurity/trivy-action@v0.36.0
         env:
           # Trivy pulls the image itself rather than through the Docker daemon,
@@ -108,27 +118,53 @@ jobs:
           scan-type: image
           scanners: ${{ inputs.scanners }}
           severity: ${{ inputs.severity }}
-          # Unfixed CVEs are reported by the full-report step below but do not
-          # fail the gate: there is no action to take on them beyond waiting
-          # for the base image to carry a patch.
+          # Leaves out vulnerabilities with no released fix, since there is no
+          # action to take on one beyond waiting for the base image to carry a
+          # patch. Set `ignore_unfixed: false` to have them in the report too,
+          # which now costs nothing but noise: nothing here gates on findings.
           ignore-unfixed: ${{ inputs.ignore_unfixed }}
           format: table
           output: trivy-report.txt
-          exit-code: "1"
+          # Report only. A non-zero code here would fail the step, the job, and
+          # every caller waiting on it, which is what used to hold a release
+          # behind a CVE in a base image that had no patch yet. The findings
+          # still land in the summary and the artifact below.
+          exit-code: "0"
 
       - name: Publish report
         if: always()
         run: |
+          set -euo pipefail
+
+          # Trivy writes the table only when it has something to put in it, so
+          # an empty or missing file is the clean result rather than a failure
+          # to produce one. Unless the scanner itself fell over, in which case
+          # the same empty file means nothing was looked at, and reporting that
+          # as "no findings" would be the one genuinely dangerous thing this
+          # step could say.
+          if [[ "${{ steps.scan.outcome }}" != "success" ]]; then
+            headline="the scan did not complete, so nothing was checked"
+          elif [[ -s trivy-report.txt ]]; then
+            headline="findings at \`${{ inputs.severity }}\`, reported and not gated"
+          else
+            headline="no findings at \`${{ inputs.severity }}\`"
+          fi
+
           {
             echo "### Container scan: \`$IMAGE_REF\`"
             echo
-            echo "Severities gated: \`${{ inputs.severity }}\`"
+            echo "$headline"
+            echo
+            echo "This scan is **report only**. It does not fail the build or"
+            echo "hold up a publish."
             echo
             echo '```'
             if [[ -s trivy-report.txt ]]; then
               cat trivy-report.txt
+            elif [[ "${{ steps.scan.outcome }}" != "success" ]]; then
+              echo "See the failed step above."
             else
-              echo "No findings at the gated severities."
+              echo "Nothing to report."
             fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

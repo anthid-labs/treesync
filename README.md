@@ -800,10 +800,20 @@ a reason.
 
 Bump `version` under `[workspace.package]` and merge to `main`. CI publishes
 both crates in dependency order, `treesync` before `treesync-cli`, and only once
-the lint, the tests, the image build and the image scan have all passed: a
-version number is burned on crates.io even if the crate is yanked a minute
-later. A version already published is skipped, so a merge that does not bump it
-releases nothing.
+the lint, the tests and the image build have all passed: a version number is
+burned on crates.io even if the crate is yanked a minute later. A version
+already published is skipped, so a merge that does not bump it releases nothing.
+
+Nothing but a merge to `main` releases anything. A pull request, a branch and a
+fork all run the lint and the tests and stop there. A manual run of the workflow
+can build and publish, but only from `main`, which is the way to retry a publish
+that failed on something transient rather than pushing an empty commit.
+
+The container scan does not gate any of this. It runs beside the image push and
+reports; a CVE in the base image with no patch available should not be able to
+hold a release. Its findings are in the run summary and in a `trivy-report`
+artifact, kept for 30 days. That makes the scan badge above mean "the scan ran",
+not "the image is clean", so read the report rather than the badge.
 
 Versions are inherited from `[workspace.package]`, so both crates and the image
 move together.
