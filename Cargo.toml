@@ -92,3 +92,14 @@ zstd = "0.13"
 # Telemetry
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter", "std", "ansi"] }
+
+# Metrics, split the same way logging is: the library records through the
+# `metrics` facade and installs nothing, the binary at the top of the stack
+# installs one recorder. A library that installed its own would fight whatever
+# its host application had already set up, exactly as a tracing subscriber
+# would.
+metrics = { version = "0.24", default-features = false }
+# Only the scrape listener. The default features also build the push gateway,
+# which drags in rustls and an HTTP client to talk to a service treesync does
+# not have. Prometheus scrapes the daemon; nothing has to run alongside it.
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }

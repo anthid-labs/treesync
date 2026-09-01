@@ -1,11 +1,13 @@
-//! Process-wide logging setup.
+//! Process-wide logging and metrics setup.
 //!
-//! Lives in the CLI rather than the library because it is a property of a
-//! *process*, not of syncing: it installs a global subscriber, which is a
-//! decision only the binary at the top of the stack gets to make. A library
-//! that did this would fight whatever its host application had already set up.
-//! [`treesync`] emits `tracing` events and leaves collecting them to the caller.
+//! Lives in the CLI rather than the library because both are a property of a
+//! *process*, not of syncing: one installs a global subscriber and the other a
+//! global recorder, which are decisions only the binary at the top of the stack
+//! gets to make. A library that did either would fight whatever its host
+//! application had already set up. [`treesync`] emits `tracing` events and
+//! `metrics` measurements, and leaves collecting both to the caller.
 
+pub mod exporter;
 pub mod provider;
 
 pub use provider::{LogSink, TelemetryProvider, TelemetryProviderConfig};

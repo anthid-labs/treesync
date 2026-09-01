@@ -101,6 +101,16 @@ pub struct Changes {
     /// available where the backend supplies rename cookies: inotify does,
     /// FSEvents does not, so on macOS this is always empty.
     pub renames: Vec<Rename>,
+
+    /// When the first event in this window arrived.
+    ///
+    /// Carried so the consumer can report how far behind the mirror ran: the
+    /// age of this at the moment the batch finishes applying is the lag an
+    /// operator means. It has to come from here because this is the only
+    /// layer that saw the event land, and by the time a plan has been applied
+    /// the batching window and the transfer are both mixed into the elapsed
+    /// time.
+    pub opened_at: Instant,
 }
 
 /// A unit of work for the reconciler.
@@ -129,6 +139,12 @@ pub struct EventQueue {
     /// Rename halves seen so far this window, keyed by the backend's cookie.
     half_moves: HashMap<usize, HalfMove>,
     renames: Vec<Rename>,
+    /// When the current window opened, if one is open.
+    ///
+    /// `None` while idle. Dating a window from the previous flush would count
+    /// however long the tree sat untouched as sync lag, which is the opposite
+    /// of what the number is for.
+    window_opened: Option<Instant>,
 }
 
 impl EventQueue {
@@ -139,7 +155,16 @@ impl EventQueue {
             pending: HashSet::new(),
             half_moves: HashMap::new(),
             renames: Vec::new(),
+            window_opened: None,
         }
+    }
+
+    /// Paths observed but not yet emitted in a batch.
+    ///
+    /// A queue that stays deep is a sync that cannot keep up with its tree,
+    /// which is visible here well before it shows up as anything else.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
     }
 
     /// Waits for the next batch, or `None` once the watcher has stopped and
@@ -202,6 +227,10 @@ impl EventQueue {
             return;
         };
 
+        // Set before the insert, so it dates from the first event of the
+        // window rather than from whichever one happened to be new.
+        self.window_opened.get_or_insert_with(Instant::now);
+
         // Every event makes its path suspect, including both halves of a
         // rename, so that ignoring `renames` is always safe.
         self.pending.insert(event.path.clone());
@@ -240,6 +269,12 @@ impl EventQueue {
         let paths: Vec<PathBuf> = self.pending.drain().collect();
         let renames = std::mem::take(&mut self.renames);
 
+        // Only reachable with something pending, so the window is always open
+        // here. `now` rather than a panic if that ever stops being true: a
+        // lag figure of zero is a wrong number, and an operator would rather
+        // have one of those than a daemon that stopped syncing.
+        let opened_at = self.window_opened.take().unwrap_or_else(Instant::now);
+
         // Halves still unmatched had their partner fall outside this window, or
         // outside the watched tree entirely. Dropping them costs only the
         // optimization: both paths are already in `paths`. Clearing also keeps
@@ -252,7 +287,11 @@ impl EventQueue {
             "flushing batch"
         );
 
-        Changes { paths, renames }
+        Changes {
+            paths,
+            renames,
+            opened_at,
+        }
     }
 
     /// Discards accumulated work and reports that a subtree must be re-walked.
@@ -262,6 +301,7 @@ impl EventQueue {
         self.pending.clear();
         self.half_moves.clear();
         self.renames.clear();
+        self.window_opened = None;
 
         Batch::Rescan { root }
     }
@@ -321,6 +361,82 @@ mod tests {
 
     fn paths(batch: Batch) -> Vec<PathBuf> {
         changes(batch).paths
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_window_is_dated_from_its_first_event_not_from_the_flush() {
+        let (tx, mut queue) = queue(100);
+
+        // The queue sits idle here. If a window were dated from the previous
+        // flush, this hour would be reported as sync lag, and every mirror
+        // that was ever left alone would look catastrophically behind.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+
+        send(&tx, EventKind::Modify, "/tree/a").await;
+        let opened_at = changes(queue.next_batch().await.expect("batch")).opened_at;
+
+        assert!(
+            opened_at.elapsed() < Duration::from_secs(2),
+            "the window should date from the event, not from an hour of quiet: {:?}",
+            opened_at.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_window_keeps_the_first_event_of_several() {
+        let (tx, mut queue) = queue(100);
+
+        send(&tx, EventKind::Modify, "/tree/first").await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        send(&tx, EventKind::Modify, "/tree/second").await;
+
+        let changes = changes(queue.next_batch().await.expect("batch"));
+
+        assert_eq!(changes.paths.len(), 2);
+        assert!(
+            changes.opened_at.elapsed() >= Duration::from_millis(500),
+            "lag is measured from the oldest event in the batch, not the newest"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_batch_still_reports_when_its_window_opened() {
+        // The shutdown path. `drain` emits without waiting out the window, and
+        // the events in it are as old as any other batch's.
+        let (tx, mut queue) = queue(100);
+
+        send(&tx, EventKind::Modify, "/tree/a").await;
+
+        // Let the event reach the queue's own buffer before draining.
+        if let Some(event) = queue.stream.recv().await {
+            queue.merge(event);
+        }
+        tokio::time::advance(Duration::from_millis(300)).await;
+
+        let changes = changes(queue.drain().expect("something is pending"));
+
+        assert!(
+            changes.opened_at.elapsed() >= Duration::from_millis(300),
+            "a flush at shutdown does not make the work it holds newly arrived"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_reports_what_is_waiting() {
+        let (tx, mut queue) = queue(100);
+
+        assert_eq!(queue.pending(), 0, "an idle queue holds nothing");
+
+        send(&tx, EventKind::Modify, "/tree/a").await;
+        send(&tx, EventKind::Modify, "/tree/b").await;
+        let batch = queue.next_batch().await.expect("batch");
+
+        assert_eq!(paths(batch).len(), 2);
+        assert_eq!(
+            queue.pending(),
+            0,
+            "everything pending went into the batch that was just emitted"
+        );
     }
 
     #[tokio::test(start_paused = true)]

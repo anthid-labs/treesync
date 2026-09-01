@@ -56,7 +56,7 @@ async fn sync_once(source: &Path, target: &Path, config: &ReconcileConfig) -> us
         report.failures
     );
 
-    report.applied
+    report.applied.total()
 }
 
 /// Asserts the two trees are indistinguishable to the reconciler.
@@ -253,7 +253,7 @@ async fn a_failing_action_does_not_strand_the_rest_of_the_batch() {
     let sink = LocalSink::new(target.path()).expect("sink");
     let report = apply(&plan, source.path(), &sink, Preserve::default()).await;
 
-    assert_eq!(report.applied, 2);
+    assert_eq!(report.applied.total(), 2);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(
         report.failed_paths().collect::<Vec<_>>(),

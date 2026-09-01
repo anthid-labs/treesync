@@ -27,6 +27,18 @@ services:
         target: /etc/treesync/config.toml
         mode: 0444
 
+    # Prometheus metrics, from `[metrics] listen` in config.toml.
+    #
+    # `host` mode rather than the routing mesh: the mesh would load balance
+    # scrapes across tasks, and a scraper that lands on a different task each
+    # time produces one series full of resets rather than a reading per node.
+    # A scraper on the overlay network can reach the task directly instead.
+    ports:
+      - target: 9099
+        published: 9099
+        protocol: tcp
+        mode: host
+
     # Bind mounts, so the data is the node's own. `volumes:` below would give
     # each task a fresh empty volume instead, which for a mirror means syncing
     # into nothing.

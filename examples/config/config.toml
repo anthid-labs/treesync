@@ -5,6 +5,17 @@
 # so no --config flag is needed. Unknown keys are a startup error and not a
 # setting that silently never applied, so a typo here fails loudly.
 
+# Prometheus metrics, served by `watch` only.
+#
+# 0.0.0.0 rather than a loopback address: inside a container, 127.0.0.1 is the
+# container's own loopback, so nothing outside it could ever scrape. The
+# endpoint has no authentication and it names every sync, so keep the port off
+# any public network. Under Compose that means publishing it as
+# `127.0.0.1:9099:9099`; under Kubernetes it is reachable only inside the
+# cluster unless a Service says otherwise.
+[metrics]
+listen = "0.0.0.0:9099"
+
 [[sync]]
 name = "app"
 source = "/data/src"

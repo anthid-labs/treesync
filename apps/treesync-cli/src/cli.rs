@@ -14,6 +14,15 @@
 //! stops, `watch` goes on to reconcile whatever the watcher reports. Nothing
 //! in this module compares trees or applies a plan itself, so the two cannot
 //! drift apart.
+//!
+//! # Metrics belong to `watch`
+//!
+//! Only `watch` serves them. `sync` and `check` are commands that exit, and a
+//! scrape endpoint that stops existing before Prometheus can reach it is worse
+//! than none: it would be scraped once in a while by luck and produce a series
+//! full of holes. The library records the same measurements either way, so a
+//! one-shot pass run from an embedder that does have somewhere to put them
+//! still reports.
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +35,8 @@ use treesync::error::{Error, Result};
 
 use treesync::reconcile::{Action, Plan, Scope};
 use treesync::syncer::{Mode, Syncer};
+
+use crate::telemetry::exporter;
 
 /// Where the config is read from when `--config` is not given.
 const DEFAULT_CONFIG_PATH: &str = "/etc/treesync/config.toml";
@@ -50,6 +61,14 @@ pub struct Cli {
     /// Log filter. `RUST_LOG` takes precedence when set.
     #[arg(long, global = true, env = "LOG_LEVEL")]
     pub log_level: Option<String>,
+
+    /// Serve Prometheus metrics on `host:port`, overriding `[metrics] listen`.
+    ///
+    /// Only `watch` serves them. Bind a loopback address unless the scraper is
+    /// on another host: the endpoint has no authentication and it names every
+    /// sync, its source and its target.
+    #[arg(long, global = true, env = "TREESYNC_METRICS_LISTEN")]
+    pub metrics_listen: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -108,7 +127,14 @@ impl Cli {
         match self.command {
             Command::Check => check(&config, &self.config),
             Command::Sync { name, dry_run } => sync(&config, name.as_deref(), dry_run).await,
-            Command::Watch { name } => watch(&config, name.as_deref()).await,
+            Command::Watch { name } => {
+                // Before any syncer is opened, so a port that cannot be bound
+                // is reported before the daemon has started writing to a
+                // target and before an agent has been installed on a host.
+                serve_metrics(&config, self.metrics_listen.as_deref())?;
+
+                watch(&config, name.as_deref()).await
+            }
             Command::Agent { .. } => unreachable!("handled above"),
         }
     }
@@ -122,11 +148,45 @@ impl Cli {
     }
 }
 
+/// Starts the metrics endpoint, if one is configured.
+///
+/// The flag wins over the file, the way `--config` and `--log-level` already
+/// do: a value passed on the command line is the more specific statement of
+/// intent, and it is what makes the endpoint reachable on a host whose config
+/// is managed by something else.
+fn serve_metrics(config: &Config, flag: Option<&str>) -> Result<()> {
+    let listen = match flag {
+        Some(flag) => Some(
+            flag.parse()
+                .map_err(|err| Error::Config(format!("--metrics-listen {flag:?}: {err}")))?,
+        ),
+        None => config.metrics.listen_addr()?,
+    };
+
+    let Some(listen) = listen else {
+        return Ok(());
+    };
+
+    exporter::install(listen, env!("CARGO_PKG_VERSION")).map_err(Error::Config)?;
+
+    println!("serving metrics on http://{listen}/metrics");
+
+    Ok(())
+}
+
 /// Reports what the configuration resolves to after defaults are applied.
 fn check(config: &Config, path: &Path) -> Result<()> {
     let resolved = config.resolve();
 
     println!("{}: {} sync(s)", path.display(), resolved.len());
+
+    // Validated by `Config::parse`, so this cannot be the first report of a
+    // malformed address. Printed because `check` exists to answer "what will
+    // this config do", and opening a port is part of that answer.
+    match config.metrics.listen_addr()? {
+        Some(listen) => println!("  metrics    http://{listen}/metrics (watch only)"),
+        None => println!("  metrics    off (set [metrics] listen to serve them)"),
+    }
 
     for sync in &resolved {
         println!();
@@ -252,7 +312,7 @@ async fn sync_once(entry: &ResolvedSync, dry_run: bool) -> Result<()> {
     syncer.close().await;
 
     if report.is_complete() {
-        println!("  applied {}", report.applied);
+        println!("  applied {} ({})", report.applied.total(), report.applied);
         return Ok(());
     }
 
@@ -260,7 +320,7 @@ async fn sync_once(entry: &ResolvedSync, dry_run: bool) -> Result<()> {
     // know which files did not make it.
     println!(
         "  applied {}, failed {}",
-        report.applied,
+        report.applied.total(),
         report.failures.len()
     );
     for failure in &report.failures {

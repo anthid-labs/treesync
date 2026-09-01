@@ -1,8 +1,10 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
-use super::Sink;
+use super::{Sink, TransferStats};
 use crate::error::{Error, Result};
 use crate::reconcile::{Index, IndexOptions, Metadata, Preserve, Scope, index_scope};
 
@@ -174,9 +176,9 @@ async fn relax_for(directory: &Path, error: &Error) -> Option<u32> {
 /// old file or the new one, never a half-written one. Its own function so
 /// [`Sink::write_file`] can run it twice, once normally and once against a
 /// widened parent directory, without the body being written out twice.
-async fn publish(source: &Path, temporary: &Path, destination: &Path) -> Result<()> {
+async fn publish(source: &Path, temporary: &Path, destination: &Path) -> Result<u64> {
     let result = async {
-        copy_into_fresh(source, temporary).await?;
+        let copied = copy_into_fresh(source, temporary).await?;
 
         // Before the rename, so the file is never visible with the wrong
         // timestamp. Without this the reconciler sees a differing mtime on
@@ -189,7 +191,7 @@ async fn publish(source: &Path, temporary: &Path, destination: &Path) -> Result<
 
         tokio::fs::rename(temporary, destination).await?;
 
-        Ok::<(), std::io::Error>(())
+        Ok::<u64, std::io::Error>(copied)
     }
     .await;
 
@@ -216,7 +218,7 @@ async fn publish(source: &Path, temporary: &Path, destination: &Path) -> Result<
 ///
 /// `std::io::copy` between two files reaches `copy_file_range`, so the copy
 /// still happens inside the kernel rather than through a userspace buffer.
-async fn copy_into_fresh(source: &Path, temporary: &Path) -> std::io::Result<()> {
+async fn copy_into_fresh(source: &Path, temporary: &Path) -> std::io::Result<u64> {
     match tokio::fs::remove_file(temporary).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -233,9 +235,7 @@ async fn copy_into_fresh(source: &Path, temporary: &Path) -> std::io::Result<()>
             .create_new(true)
             .open(&temporary)?;
 
-        std::io::copy(&mut input, &mut output)?;
-
-        Ok(())
+        std::io::copy(&mut input, &mut output)
     })
     .await
     .map_err(|err| std::io::Error::other(format!("copy task failed: {err}")))?
@@ -245,6 +245,23 @@ async fn copy_into_fresh(source: &Path, temporary: &Path) -> std::io::Result<()>
 #[derive(Debug, Clone)]
 pub struct LocalSink {
     root: PathBuf,
+
+    /// What has been copied, for [`Sink::transfer_stats`].
+    ///
+    /// Behind an `Arc` because this type is `Clone` and a clone is the same
+    /// target directory: totals kept per handle would split one sink's work
+    /// across several and understate every one of them.
+    moved: Arc<Moved>,
+}
+
+/// A local sink's running totals.
+///
+/// `Relaxed` throughout. These are counters read for reporting, so they need
+/// each write to land eventually and nothing to be ordered against them.
+#[derive(Debug, Default)]
+struct Moved {
+    bytes: AtomicU64,
+    files: AtomicU64,
 }
 
 impl LocalSink {
@@ -269,7 +286,10 @@ impl LocalSink {
             )));
         }
 
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            moved: Arc::new(Moved::default()),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -373,6 +393,12 @@ impl LocalSink {
         tokio::fs::symlink(target, path).await.map_err(Error::from)
     }
 
+    /// Adds one completed copy to the running totals.
+    fn record_copy(&self, bytes: u64) {
+        self.moved.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.moved.files.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Removes whatever is at `path`, if anything, without recursing.
     async fn clear(&self, path: &Path) -> Result<()> {
         match tokio::fs::symlink_metadata(path).await {
@@ -462,7 +488,11 @@ impl Sink for LocalSink {
         let temporary = parent.join(temporary_name(TEMP_PREFIX, &file_name.to_string_lossy()));
 
         let error = match publish(source, &temporary, &destination).await {
-            Ok(()) => return Ok(()),
+            Ok(copied) => {
+                self.record_copy(copied);
+
+                return Ok(());
+            }
             Err(error) => error,
         };
 
@@ -473,7 +503,7 @@ impl Sink for LocalSink {
         let retried = publish(source, &temporary, &destination).await;
         restore_mode(&parent, original).await;
 
-        retried
+        retried.map(|copied| self.record_copy(copied))
     }
 
     async fn create_symlink(&self, relative: &Path, target: &Path) -> Result<()> {
@@ -588,6 +618,22 @@ impl Sink for LocalSink {
         }
 
         tokio::fs::rename(&from, &to).await.map_err(Error::from)
+    }
+
+    /// A local copy always writes the whole file, so `bytes` and
+    /// `logical_bytes` are the same number and every file counts as whole.
+    /// Reported anyway rather than left at zero: an operator watching one
+    /// dashboard should not have to know which syncs are remote to read it.
+    fn transfer_stats(&self) -> TransferStats {
+        let bytes = self.moved.bytes.load(Ordering::Relaxed);
+
+        TransferStats {
+            bytes,
+            logical_bytes: bytes,
+            whole_files: self.moved.files.load(Ordering::Relaxed),
+            delta_files: 0,
+            reconnects: 0,
+        }
     }
 }
 

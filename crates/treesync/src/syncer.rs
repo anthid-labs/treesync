@@ -22,7 +22,7 @@
 //! it is from never walking the tree when nothing asked us to.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +41,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// while retrying work that is not going to succeed.
 const MAX_RETRIES: usize = 1_000;
 use crate::error::{Error, Result};
+use crate::metrics::{BatchKind, PassScope, Side, SyncMetrics};
 use crate::queue::{Batch, EventQueue};
 use crate::reconcile::{
     Filter, Index, IndexOptions, Plan, ReconcileConfig, Scope, index_scope, plan,
@@ -113,6 +114,8 @@ impl Mode {
 /// the one nobody ran.
 pub struct Syncer {
     name: String,
+    /// Everything this sync publishes, pre-labelled with its name.
+    metrics: SyncMetrics,
     /// Canonical, because watcher events arrive with symlinks resolved and
     /// paths are made relative against this.
     source_root: PathBuf,
@@ -274,6 +277,7 @@ impl Syncer {
 
         Ok(Self {
             name: config.name.clone(),
+            metrics: SyncMetrics::new(&config.name),
             source_root,
             target,
             mode,
@@ -346,6 +350,12 @@ impl Syncer {
             };
 
             retries = self.handle(batch, retries).await;
+
+            // Sampled after each batch rather than on every event. What matters
+            // is whether the queue is still deep once a batch has been applied,
+            // which is the difference between a burst and a sync that cannot
+            // keep up, and reading it here costs one load per batch.
+            self.metrics.queue_pending(queue.pending());
         }
 
         self.flush(&mut queue, retries).await;
@@ -393,6 +403,11 @@ impl Syncer {
 
     /// Reconciles one batch, returning the paths that still need attention.
     async fn handle(&self, batch: Batch, mut retries: Vec<PathBuf>) -> Vec<PathBuf> {
+        // Kept to report lag once the batch has actually been applied. Only a
+        // batch of changes has one: a rescan discards the window it interrupted,
+        // so there is no first event left to measure from.
+        let mut opened_at = None;
+
         let scope = match batch {
             Batch::Changes(changes) => {
                 let mut paths: Vec<PathBuf> = changes
@@ -400,6 +415,9 @@ impl Syncer {
                     .iter()
                     .filter_map(|path| self.relativize(path))
                     .collect();
+
+                self.metrics.batch(BatchKind::Changes, paths.len());
+                opened_at = Some(changes.opened_at);
 
                 // Folded in here rather than reconciled separately: a path that
                 // failed and has since changed again should be looked at once.
@@ -417,6 +435,8 @@ impl Syncer {
             }
             Batch::Rescan { root } => {
                 let prefix = self.relativize(&root).unwrap_or_default();
+
+                self.metrics.batch(BatchKind::Rescan, 0);
 
                 // The walk covers everything beneath it, so those retries are
                 // subsumed. Ones outside stay queued for the next batch.
@@ -445,6 +465,13 @@ impl Syncer {
 
         carried.append(&mut retries);
 
+        // After the reconcile, not before: the number an operator wants is how
+        // far behind the mirror actually was, which is the batching window plus
+        // the walk plus the transfer, and only the last of those is known here.
+        if let Some(opened_at) = opened_at {
+            self.metrics.lag(opened_at.elapsed());
+        }
+
         self.bound(carried)
     }
 
@@ -453,15 +480,23 @@ impl Syncer {
         paths.sort();
         paths.dedup();
 
+        let mut dropped = 0;
+
         if paths.len() > MAX_RETRIES {
+            dropped = paths.len() - MAX_RETRIES;
+
             tracing::warn!(
                 sync = %self.name,
-                dropped = paths.len() - MAX_RETRIES,
+                dropped,
                 "too many failing paths to retry; dropping the excess"
             );
 
             paths.truncate(MAX_RETRIES);
         }
+
+        // Both together, so a dashboard shows a retry set that stopped growing
+        // next to the reason it stopped. Growth alone looks like recovery.
+        self.metrics.retries(paths.len(), dropped);
 
         paths
     }
@@ -477,21 +512,42 @@ impl Syncer {
         let owned = scope.clone();
         let options = self.index_options.clone();
 
+        // Only a whole-tree scope has seen the whole tree. An incremental
+        // batch indexes the handful of paths it was told about, and publishing
+        // that count as the tree's size would make the gauge collapse to
+        // almost nothing every time a single file changed.
+        let pass = PassScope::of(scope);
+        let totals = |index: &Index| pass.is_whole_tree().then(|| index.totals());
+
         // Statting is blocking work, and a full-tree scope can be a lot of it;
         // hashing under `Verify::Checksum` is more so.
+        let started = Instant::now();
         let source_index =
             tokio::task::spawn_blocking(move || index_scope(&source_root, &owned, &options))
                 .await
                 .map_err(|err| Error::Internal(format!("index task failed: {err}")))??;
+        self.metrics
+            .indexed(Side::Source, started.elapsed(), totals(&source_index));
 
+        let started = Instant::now();
         let target_index = match self.target.sink() {
             Some(sink) => sink.index(scope, &self.index_options).await?,
             // Only reachable under `Mode::DryRun` against a target that does
             // not exist yet, which nothing created.
             None => Index::default(),
         };
+        self.metrics
+            .indexed(Side::Target, started.elapsed(), totals(&target_index));
 
-        Ok(plan(&source_index, &target_index, scope, &self.reconcile))
+        // Timed separately from the two walks around it, because this is the
+        // only part with no I/O in it. A diff that is slow when the walks are
+        // not is a tree with an extreme number of entries, which is a
+        // different problem from a slow disk and wants telling apart.
+        let started = Instant::now();
+        let plan = plan(&source_index, &target_index, scope, &self.reconcile);
+        self.metrics.planned(started.elapsed(), &plan.counts());
+
+        Ok(plan)
     }
 
     /// Applies a plan produced by [`Syncer::plan_for`].
@@ -508,14 +564,28 @@ impl Syncer {
             ))
         })?;
 
+        let started = Instant::now();
         let report = apply(plan, &self.source_root, sink, self.reconcile.preserve).await;
 
+        self.metrics
+            .applied(started.elapsed(), &report.applied, &report.failed());
+
+        // Read after the apply rather than accumulated per action: the sink
+        // holds the running total already, so publishing it here cannot double
+        // count and cannot drift from what the sink actually did.
+        self.metrics.transfer(sink.transfer_stats());
+
         if report.is_complete() {
-            tracing::info!(sync = %self.name, applied = report.applied, "reconciled");
+            tracing::info!(
+                sync = %self.name,
+                applied = report.applied.total(),
+                actions = %report.applied,
+                "reconciled"
+            );
         } else {
             tracing::warn!(
                 sync = %self.name,
-                applied = report.applied,
+                applied = report.applied.total(),
                 failed = report.failures.len(),
                 "reconciled with failures"
             );
@@ -525,17 +595,47 @@ impl Syncer {
     }
 
     /// Compares both sides within `scope` and applies the difference.
+    ///
+    /// The one place a whole pass begins and ends, which is why the pass-level
+    /// series are recorded here and the per-stage ones inside the two calls
+    /// below. A pass that found nothing to do still counts as a successful
+    /// one: an idle mirror is a mirror that is up to date, and if agreeing with
+    /// the source did not refresh `treesync_sync_last_success_timestamp_seconds`
+    /// then every healthy sync would eventually look stalled.
     async fn reconcile_scope(&self, scope: &Scope) -> Result<ApplyReport> {
-        let plan = self.plan_for(scope).await?;
+        let pass = PassScope::of(scope);
+        let started = Instant::now();
+
+        self.metrics.pass_started(pass);
+
+        let plan = match self.plan_for(scope).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.metrics.pass_failed(pass, started.elapsed());
+
+                return Err(error);
+            }
+        };
 
         if plan.is_empty() {
-            return Ok(ApplyReport {
-                applied: 0,
-                failures: Vec::new(),
-            });
+            self.metrics.pass_finished(pass, started.elapsed(), true);
+
+            return Ok(ApplyReport::empty());
         }
 
-        self.apply_plan(&plan).await
+        let report = match self.apply_plan(&plan).await {
+            Ok(report) => report,
+            Err(error) => {
+                self.metrics.pass_failed(pass, started.elapsed());
+
+                return Err(error);
+            }
+        };
+
+        self.metrics
+            .pass_finished(pass, started.elapsed(), report.is_complete());
+
+        Ok(report)
     }
 
     /// Makes a watcher path relative to the source root.

@@ -162,6 +162,26 @@ impl Index {
         self.entries.iter()
     }
 
+    /// How many entries this holds, and how much file content they name.
+    ///
+    /// Directories and symlinks count towards `entries` but not `bytes`: a
+    /// directory has no size worth reporting, and a symlink's is the length of
+    /// its target string, which is not what anyone asking how big a tree is
+    /// wants added in.
+    pub fn totals(&self) -> crate::metrics::TreeTotals {
+        crate::metrics::TreeTotals {
+            entries: self.entries.len(),
+            bytes: self
+                .entries
+                .values()
+                .map(|entry| match entry {
+                    Entry::File { size, .. } => *size,
+                    Entry::Dir { .. } | Entry::Symlink { .. } => 0,
+                })
+                .sum(),
+        }
+    }
+
     /// Paths at or beneath `prefix`. An empty prefix selects everything.
     pub fn under<'a>(&'a self, prefix: &'a Path) -> impl Iterator<Item = (&'a PathBuf, &'a Entry)> {
         self.entries
@@ -655,6 +675,40 @@ mod tests {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Totals
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn totals_count_every_entry_but_only_files_have_bytes() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+
+        std::fs::create_dir(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("a.txt"), b"12345").expect("write");
+        std::fs::write(root.join("sub/b.txt"), b"123").expect("write");
+        std::os::unix::fs::symlink("a.txt", root.join("link")).expect("symlink");
+
+        let totals = walk(root, &options()).expect("walk").totals();
+
+        // Two files, one directory, one symlink.
+        assert_eq!(totals.entries, 4);
+
+        // A directory has no size worth reporting and a symlink's is the
+        // length of its target string, which is not what "how big is this
+        // tree" means.
+        assert_eq!(totals.bytes, 8);
+    }
+
+    #[test]
+    fn an_empty_tree_totals_zero() {
+        let dir = TempDir::new().expect("temp dir");
+        let totals = walk(dir.path(), &options()).expect("walk").totals();
+
+        assert_eq!(totals.entries, 0);
+        assert_eq!(totals.bytes, 0);
     }
 
     // -----------------------------------------------------------------------

@@ -56,10 +56,14 @@
 //! # }
 //! ```
 //!
-//! # Logging
+//! # Logging and metrics
 //!
-//! Events are emitted through [`tracing`]. No subscriber is installed here;
-//! that belongs to whatever binary is at the top of the stack.
+//! Events are emitted through [`tracing`] and measurements through the
+//! `metrics` facade. Neither a subscriber nor a recorder is installed here;
+//! both belong to whatever binary is at the top of the stack. With nothing
+//! installed, both are a branch on an atomic, so an embedder that wants
+//! neither pays for neither. See [`metrics`] for what is published and how to
+//! read it.
 //!
 //! # Remote targets
 //!
@@ -72,6 +76,7 @@
 
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod queue;
 pub mod reconcile;
 pub mod remote;

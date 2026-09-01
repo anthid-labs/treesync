@@ -77,7 +77,7 @@ impl Remote {
                 .collect::<Vec<_>>()
         );
 
-        report.applied
+        report.applied.total()
     }
 
     async fn sync_allowing_failures(
@@ -448,6 +448,55 @@ async fn a_small_edit_to_a_large_file_sends_almost_nothing() {
         sent < original.len() as u64 / 10,
         "a one field edit sent {sent} bytes of a {} byte file; the delta is not working",
         original.len()
+    );
+}
+
+#[tokio::test]
+async fn the_transfer_counters_separate_a_delta_from_a_whole_file() {
+    // What the two byte totals are for: the ratio between them is the only
+    // thing that says whether the delta is earning its keep, and it is wrong
+    // unless a whole-file transfer contributes to both.
+    let remote = Remote::new().await;
+
+    let original = json_blob(20_000);
+    remote.write("big.json", &original);
+    remote.sync(&preserving_mode()).await;
+
+    let first = remote.sink.transfer_stats();
+    assert_eq!(
+        first.whole_files, 1,
+        "nothing was on the target, so this had to go whole"
+    );
+    assert_eq!(first.delta_files, 0);
+    assert_eq!(
+        first.bytes, first.logical_bytes,
+        "a whole-file transfer sends every byte it accounts for"
+    );
+
+    let edited = original.replacen("\"name\": \"record-10000\"", "\"name\": \"CHANGED\"", 1);
+    remote.write("big.json", &edited);
+    remote.sync(&preserving_mode()).await;
+
+    let second = remote.sink.transfer_stats();
+
+    assert_eq!(second.whole_files, 1, "no new whole-file transfer");
+    assert_eq!(
+        second.delta_files, 1,
+        "the second pass had a copy to build on"
+    );
+    assert_eq!(second.reconnects, 0, "the link never dropped in this test");
+
+    let sent = second.bytes - first.bytes;
+    let covered = second.logical_bytes - first.logical_bytes;
+
+    assert_eq!(
+        covered,
+        edited.len() as u64,
+        "the delta covered the whole file even though it sent a fraction of it"
+    );
+    assert!(
+        sent < covered / 10,
+        "sent {sent} of {covered} bytes; the two counters would show no saving"
     );
 }
 

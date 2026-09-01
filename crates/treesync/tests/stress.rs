@@ -241,7 +241,7 @@ async fn full_pass(source: &Path, target: &Path, report_memory: bool) -> (usize,
         &report.failures[..report.failures.len().min(3)]
     );
 
-    (report.applied, started.elapsed())
+    (report.applied.total(), started.elapsed())
 }
 
 fn rate(count: usize, elapsed: Duration) -> String {
